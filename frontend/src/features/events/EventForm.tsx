@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { DateTimeInput } from "@/components/DateTimeInput";
 import { useLabels } from "@/features/labels/useLabels";
 import type { Event } from "@/lib/types";
 
@@ -105,7 +106,10 @@ export function EventForm({
               <FormItem>
                 <FormLabel>Start</FormLabel>
                 <FormControl>
-                  <Input type="datetime-local" {...field} />
+                  <DateTimeInput
+                    value={field.value}
+                    onChange={field.onChange}
+                  />
                 </FormControl>
                 <FormMessage />
               </FormItem>
@@ -118,7 +122,10 @@ export function EventForm({
               <FormItem>
                 <FormLabel>End</FormLabel>
                 <FormControl>
-                  <Input type="datetime-local" {...field} />
+                  <DateTimeInput
+                    value={field.value}
+                    onChange={field.onChange}
+                  />
                 </FormControl>
                 <FormMessage />
               </FormItem>

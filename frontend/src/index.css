@@ -85,3 +85,11 @@
       ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
 }
+
+@keyframes flash-highlight {
+  0% { background-color: oklch(0.92 0.13 95); }
+  100% { background-color: transparent; }
+}
+.flash-highlight {
+  animation: flash-highlight 1.8s ease-out;
+}

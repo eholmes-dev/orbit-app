@@ -46,3 +46,23 @@ export function useDeleteAvailability() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["availability"] }),
   });
 }
+
+export interface SyncResult {
+  synced: number;
+  perPerson: Array<{
+    personId: string;
+    email: string;
+    status: "synced" | "error";
+    count: number;
+    error?: string;
+  }>;
+}
+
+export function useSyncOutlookAvailability() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { personIds: string[]; from: string; to: string }) =>
+      api.post<SyncResult>("/api/availability/sync-from-outlook", input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["availability"] }),
+  });
+}

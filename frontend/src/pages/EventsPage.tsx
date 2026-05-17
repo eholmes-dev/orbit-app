@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Pencil, Trash2, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -85,6 +86,25 @@ export function EventsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<Event | null>(null);
   const [deleting, setDeleting] = useState<Event | null>(null);
+
+  // Scroll to and flash the row referenced by ?focus=<eventId> (deep-link from
+  // the Schedule page's conflict cards).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusId = searchParams.get("focus");
+  const rowRefs = useRef<Map<string, HTMLTableRowElement | null>>(new Map());
+  useEffect(() => {
+    if (!focusId || !events) return;
+    const el = rowRefs.current.get(focusId);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("flash-highlight");
+    const t = setTimeout(() => el.classList.remove("flash-highlight"), 1800);
+    // Drop the param so a manual re-navigation doesn't re-flash forever.
+    const next = new URLSearchParams(searchParams);
+    next.delete("focus");
+    setSearchParams(next, { replace: true });
+    return () => clearTimeout(t);
+  }, [focusId, events, searchParams, setSearchParams]);
 
   const handleCreate = async (values: EventFormValues) => {
     try {
@@ -178,7 +198,12 @@ export function EventsPage() {
                 </TableRow>
               )}
               {events.map((ev) => (
-                <TableRow key={ev.id}>
+                <TableRow
+                  key={ev.id}
+                  ref={(el) => {
+                    rowRefs.current.set(ev.id, el);
+                  }}
+                >
                   <TableCell className="font-medium">
                     {ev.title}
                     {ev.isHardRequirement && (

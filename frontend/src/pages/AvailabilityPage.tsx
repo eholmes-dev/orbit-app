@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { Pencil, Trash2, Plus } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { Pencil, Trash2, Plus, RefreshCw, Repeat } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,11 +43,18 @@ import {
   useCreateAvailability,
   useUpdateAvailability,
   useDeleteAvailability,
+  useSyncOutlookAvailability,
 } from "@/features/availability/useAvailability";
 import {
   AvailabilityForm,
   type AvailabilityFormValues,
 } from "@/features/availability/AvailabilityForm";
+import {
+  groupRecurring,
+  formatWeekdays,
+  formatTimeOfDayRange,
+  formatDateSpan,
+} from "@/features/availability/groupRecurring";
 import type {
   Availability,
   AvailabilityType,
@@ -79,12 +87,31 @@ function formatRange(start: string, end: string): string {
 
 export function AvailabilityPage() {
   const { data: people } = usePeople();
-  const [personId, setPersonId] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [personId, setPersonId] = useState<string | null>(
+    () => searchParams.get("personId"),
+  );
+
+  // Stay in sync if the URL changes (e.g., user navigates from a People row).
+  useEffect(() => {
+    const fromUrl = searchParams.get("personId");
+    if (fromUrl && fromUrl !== personId) setPersonId(fromUrl);
+  }, [searchParams, personId]);
+
+  const selectPerson = (v: string) => {
+    setPersonId(v);
+    const next = new URLSearchParams(searchParams);
+    next.set("personId", v);
+    setSearchParams(next, { replace: true });
+  };
+
   const { data: records, isLoading } = useAvailability(personId);
+  const grouped = useMemo(() => (records ? groupRecurring(records) : []), [records]);
 
   const createMutation = useCreateAvailability();
   const updateMutation = useUpdateAvailability();
   const deleteMutation = useDeleteAvailability();
+  const syncMutation = useSyncOutlookAvailability();
 
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<Availability | null>(null);
@@ -139,6 +166,31 @@ export function AvailabilityPage() {
     }
   };
 
+  const handleSync = async () => {
+    if (!personId) return;
+    // Sync window: today through 60 days out (covers next month + buffer).
+    const from = new Date();
+    from.setHours(0, 0, 0, 0);
+    const to = new Date();
+    to.setDate(to.getDate() + 60);
+    to.setHours(23, 59, 59, 999);
+    try {
+      const result = await syncMutation.mutateAsync({
+        personIds: [personId],
+        from: from.toISOString(),
+        to: to.toISOString(),
+      });
+      const me = result.perPerson[0];
+      if (me?.status === "error") {
+        toast.error(`Sync failed: ${me.error}`);
+      } else {
+        toast.success(`Synced ${result.synced} busy window${result.synced === 1 ? "" : "s"} from Outlook`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Sync failed");
+    }
+  };
+
   return (
     <div className="p-8 max-w-5xl mx-auto">
       <div className="mb-6">
@@ -153,7 +205,7 @@ export function AvailabilityPage() {
           <label className="text-sm font-medium mb-1.5 block">Person</label>
           <Select
             value={personId ?? undefined}
-            onValueChange={(v) => setPersonId(v)}
+            onValueChange={selectPerson}
           >
             <SelectTrigger>
               <SelectValue placeholder="Pick a person" />
@@ -167,28 +219,41 @@ export function AvailabilityPage() {
             </SelectContent>
           </Select>
         </div>
-        <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-          <DialogTrigger asChild>
-            <Button disabled={!personId}>
-              <Plus className="size-4" /> Add availability
-            </Button>
-          </DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>
-                New availability {selectedPerson && `for ${selectedPerson.name}`}
-              </DialogTitle>
-              <DialogDescription>
-                The scheduler will treat this person as unavailable during this window.
-              </DialogDescription>
-            </DialogHeader>
-            <AvailabilityForm
-              onSubmit={handleCreate}
-              submitLabel="Add"
-              isSubmitting={createMutation.isPending}
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            disabled={!personId || syncMutation.isPending}
+            onClick={handleSync}
+            title="Pull this person's busy windows from their Outlook calendar"
+          >
+            <RefreshCw
+              className={`size-4 ${syncMutation.isPending ? "animate-spin" : ""}`}
             />
-          </DialogContent>
-        </Dialog>
+            {syncMutation.isPending ? "Syncing…" : "Sync from Outlook"}
+          </Button>
+          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+            <DialogTrigger asChild>
+              <Button disabled={!personId}>
+                <Plus className="size-4" /> Add availability
+              </Button>
+            </DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>
+                  New availability {selectedPerson && `for ${selectedPerson.name}`}
+                </DialogTitle>
+                <DialogDescription>
+                  The scheduler will treat this person as unavailable during this window.
+                </DialogDescription>
+              </DialogHeader>
+              <AvailabilityForm
+                onSubmit={handleCreate}
+                submitLabel="Add"
+                isSubmitting={createMutation.isPending}
+              />
+            </DialogContent>
+          </Dialog>
+        </div>
       </div>
 
       {!personId && (
@@ -216,27 +281,115 @@ export function AvailabilityPage() {
                   </TableCell>
                 </TableRow>
               )}
-              {records.map((r) => (
-                <TableRow key={r.id}>
-                  <TableCell>
-                    <Badge variant={TYPE_BADGE[r.type]}>{r.type}</Badge>
-                  </TableCell>
-                  <TableCell className="text-sm">
-                    {formatRange(r.startDateTime, r.endDateTime)}
-                  </TableCell>
-                  <TableCell className="text-muted-foreground text-xs">
-                    {r.source}
-                  </TableCell>
-                  <TableCell className="text-right space-x-1">
-                    <Button size="icon" variant="ghost" onClick={() => setEditing(r)}>
-                      <Pencil className="size-4" />
-                    </Button>
-                    <Button size="icon" variant="ghost" onClick={() => setDeleting(r)}>
-                      <Trash2 className="size-4" />
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
+              {grouped.map((g) => {
+                if (g.kind === "single") {
+                  const r = g.record;
+                  const isSynced = r.source === "outlook_sync";
+                  return (
+                    <TableRow key={r.id}>
+                      <TableCell>
+                        <Badge variant={TYPE_BADGE[r.type]}>{r.type}</Badge>
+                      </TableCell>
+                      <TableCell className="text-sm">
+                        {formatRange(r.startDateTime, r.endDateTime)}
+                      </TableCell>
+                      <TableCell>
+                        {isSynced ? (
+                          <Badge variant="outline" className="font-normal">
+                            Outlook
+                          </Badge>
+                        ) : (
+                          <span className="text-muted-foreground text-xs">manual</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right space-x-1">
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          onClick={() => setEditing(r)}
+                          disabled={isSynced}
+                          title={
+                            isSynced
+                              ? "Synced from Outlook — edit in Outlook, then re-sync"
+                              : "Edit"
+                          }
+                        >
+                          <Pencil className="size-4" />
+                        </Button>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          onClick={() => setDeleting(r)}
+                          disabled={isSynced}
+                          title={
+                            isSynced
+                              ? "Synced from Outlook — delete in Outlook, then re-sync"
+                              : "Delete"
+                          }
+                        >
+                          <Trash2 className="size-4" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  );
+                }
+                // Recurring group
+                const isSynced = g.source === "outlook_sync";
+                const groupKey = g.records[0].id;
+                return (
+                  <TableRow key={`group-${groupKey}`}>
+                    <TableCell>
+                      <div className="flex items-center gap-1.5">
+                        <Badge variant={TYPE_BADGE[g.type]}>{g.type}</Badge>
+                        <Repeat className="size-3.5 text-muted-foreground" />
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-sm">
+                      <div className="font-medium">
+                        {formatWeekdays(g.weekdays)} · {formatTimeOfDayRange(g.startTimeOfDay, g.endTimeOfDay)}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-0.5">
+                        {g.records.length} occurrences · {formatDateSpan(g.firstStart, g.lastStart)}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      {isSynced ? (
+                        <Badge variant="outline" className="font-normal">
+                          Outlook
+                        </Badge>
+                      ) : (
+                        <span className="text-muted-foreground text-xs">manual</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right space-x-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        disabled
+                        title={
+                          isSynced
+                            ? "Recurring series synced from Outlook — edit in Outlook, then re-sync"
+                            : "Recurring series — edit individual occurrences not yet supported"
+                        }
+                      >
+                        <Pencil className="size-4" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        disabled
+                        title={
+                          isSynced
+                            ? "Recurring series synced from Outlook — delete in Outlook, then re-sync"
+                            : "Recurring series — delete individual occurrences not yet supported"
+                        }
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         </div>

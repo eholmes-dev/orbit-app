@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { Play, AlertTriangle, AlertCircle, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -28,6 +29,29 @@ function plusDaysLocal(days: number): string {
   d.setDate(d.getDate() + days);
   const tz = d.getTimezoneOffset() * 60_000;
   return new Date(d.getTime() - tz).toISOString().slice(0, 10) + "T23:59";
+}
+
+function localStr(d: Date, time: "00:00" | "23:59"): string {
+  const tz = d.getTimezoneOffset() * 60_000;
+  return new Date(d.getTime() - tz).toISOString().slice(0, 10) + "T" + time;
+}
+
+// Monday-start week containing `from`.
+function thisWeekRange(from: Date = new Date()): [string, string] {
+  const start = new Date(from);
+  const day = start.getDay(); // 0=Sun..6=Sat
+  const mondayOffset = day === 0 ? -6 : 1 - day;
+  start.setDate(start.getDate() + mondayOffset);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  return [localStr(start, "00:00"), localStr(end, "23:59")];
+}
+
+function monthRange(monthsAhead: number): [string, string] {
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth() + monthsAhead, 1);
+  const end = new Date(now.getFullYear(), now.getMonth() + monthsAhead + 1, 0);
+  return [localStr(start, "00:00"), localStr(end, "23:59")];
 }
 
 function formatRange(start: string, end: string): string {
@@ -102,27 +126,56 @@ export function SchedulePage() {
         </p>
       </div>
 
-      <div className="flex items-end gap-4 border rounded-lg bg-card p-4">
-        <div className="flex-1">
-          <label className="text-sm font-medium mb-1.5 block">Start</label>
-          <Input
-            type="datetime-local"
-            value={startDate}
-            onChange={(e) => setStartDate(e.target.value)}
-          />
+      <div className="border rounded-lg bg-card p-4 space-y-3">
+        <div className="flex flex-wrap gap-2">
+          <span className="text-xs text-muted-foreground self-center mr-1">
+            Quick range:
+          </span>
+          {(
+            [
+              ["This week", () => thisWeekRange()],
+              ["This month", () => monthRange(0)],
+              ["Next month", () => monthRange(1)],
+              ["Next 30 days", () => [todayLocal(), plusDaysLocal(30)] as [string, string]],
+            ] as const
+          ).map(([label, fn]) => (
+            <Button
+              key={label}
+              size="sm"
+              variant="outline"
+              type="button"
+              onClick={() => {
+                const [s, e] = fn();
+                setStartDate(s);
+                setEndDate(e);
+              }}
+            >
+              {label}
+            </Button>
+          ))}
         </div>
-        <div className="flex-1">
-          <label className="text-sm font-medium mb-1.5 block">End</label>
-          <Input
-            type="datetime-local"
-            value={endDate}
-            onChange={(e) => setEndDate(e.target.value)}
-          />
+        <div className="flex items-end gap-4">
+          <div className="flex-1">
+            <label className="text-sm font-medium mb-1.5 block">Start</label>
+            <Input
+              type="datetime-local"
+              value={startDate}
+              onChange={(e) => setStartDate(e.target.value)}
+            />
+          </div>
+          <div className="flex-1">
+            <label className="text-sm font-medium mb-1.5 block">End</label>
+            <Input
+              type="datetime-local"
+              value={endDate}
+              onChange={(e) => setEndDate(e.target.value)}
+            />
+          </div>
+          <Button onClick={onGenerate} disabled={generate.isPending}>
+            <Play className="size-4" />
+            {generate.isPending ? "Solving…" : "Generate"}
+          </Button>
         </div>
-        <Button onClick={onGenerate} disabled={generate.isPending}>
-          <Play className="size-4" />
-          {generate.isPending ? "Solving…" : "Generate"}
-        </Button>
       </div>
 
       {generate.isPending && (
@@ -137,7 +190,39 @@ export function SchedulePage() {
         </p>
       )}
 
-      {result && (
+      {result && result.counts.events === 0 && (
+        <div className="border rounded-lg bg-card p-8 text-center">
+          <h2 className="text-lg font-medium">No events in this range</h2>
+          <p className="text-sm text-muted-foreground mt-2 max-w-md mx-auto">
+            The solver had nothing to schedule. Add events covering this date
+            range, or widen the range above.
+          </p>
+          <Button asChild className="mt-4">
+            <Link to="/events">Go to Events</Link>
+          </Button>
+        </div>
+      )}
+
+      {result &&
+        result.counts.events > 0 &&
+        (result.status === "infeasible" || result.status === "unknown") && (
+          <div className="border border-destructive/40 rounded-lg bg-destructive/5 p-4 flex items-start gap-3">
+            <AlertCircle className="size-5 text-destructive shrink-0 mt-0.5" />
+            <div>
+              <div className="font-medium">
+                Solver returned: {result.status}
+              </div>
+              <p className="text-sm text-muted-foreground mt-1">
+                The current constraints can't be satisfied. Common causes: an
+                event has fewer qualified+available people than its required
+                staff count, or two hard-requirement events overlap for the
+                only person who could cover both.
+              </p>
+            </div>
+          </div>
+        )}
+
+      {result && result.counts.events > 0 && (
         <>
           <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
             <SummaryCard label="Solver" value={result.status} />
@@ -187,7 +272,14 @@ export function SchedulePage() {
                           <TableCell>
                             <Badge variant="outline">T{a.event.priorityTier}</Badge>
                           </TableCell>
-                          <TableCell>{a.person.name}</TableCell>
+                          <TableCell>
+                            <Link
+                              to={`/people?edit=${a.person.id}`}
+                              className="hover:underline"
+                            >
+                              {a.person.name}
+                            </Link>
+                          </TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -212,9 +304,12 @@ export function SchedulePage() {
                         key={i}
                         className="border rounded-md p-3 bg-card text-sm"
                       >
-                        <div className="font-medium">
+                        <Link
+                          to={`/events?focus=${c.event_id}`}
+                          className="font-medium hover:underline"
+                        >
                           {eventTitleById.get(c.event_id) ?? c.event_id}
-                        </div>
+                        </Link>
                         <div className="mt-1 flex items-center gap-2">
                           <Badge variant="destructive">{REASON_LABEL[c.reason]}</Badge>
                           <span className="text-muted-foreground">

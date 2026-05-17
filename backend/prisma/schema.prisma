@@ -107,8 +107,25 @@ model Assignment {
   person            Person           @relation(fields: [personId], references: [id], onDelete: Cascade)
   status            AssignmentStatus @default(proposed)
   syncedToOutlookAt DateTime?
+  externalEventId   String?
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
 
   @@unique([eventId, personId])
+}
+
+// Admin session — created after Microsoft OAuth sign-in. Tokens are encrypted
+// at rest using SESSION_SECRET (AES-256-GCM); see backend/src/lib/crypto.ts.
+model Session {
+  id             String   @id
+  msUserId       String
+  email          String
+  name           String
+  accessToken    String
+  refreshToken   String
+  tokenExpiresAt DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([msUserId])
 }

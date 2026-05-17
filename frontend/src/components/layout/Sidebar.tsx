@@ -8,6 +8,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { UserMenu } from "./UserMenu";
 
 const navItems = [
   { to: "/schedule", label: "Schedule", icon: Sparkles },
@@ -43,9 +44,7 @@ export function Sidebar() {
           </NavLink>
         ))}
       </nav>
-      <div className="p-3 text-xs text-muted-foreground border-t">
-        Phase 1 · local dev
-      </div>
+      <UserMenu />
     </aside>
   );
 }

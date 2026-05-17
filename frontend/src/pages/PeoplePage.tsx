@@ -1,5 +1,6 @@
-import { useState } from "react";
-import { Pencil, Trash2, Plus } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import { Pencil, Trash2, Plus, CalendarOff } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -66,6 +67,23 @@ export function PeoplePage() {
   const [editing, setEditing] = useState<Person | null>(null);
   const [deleting, setDeleting] = useState<Person | null>(null);
 
+  // Open the edit dialog automatically when navigated to with ?edit=<id> (e.g.,
+  // from the Schedule page's person-name links).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const editIdFromUrl = searchParams.get("edit");
+  useEffect(() => {
+    if (!editIdFromUrl || !people || editing) return;
+    const target = people.find((p) => p.id === editIdFromUrl);
+    if (target) setEditing(target);
+  }, [editIdFromUrl, people, editing]);
+
+  const clearEditParam = () => {
+    if (!editIdFromUrl) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete("edit");
+    setSearchParams(next, { replace: true });
+  };
+
   const handleCreate = async (values: PersonFormValues) => {
     try {
       await createMutation.mutateAsync(toApiInput(values));
@@ -82,6 +100,7 @@ export function PeoplePage() {
       await updateMutation.mutateAsync({ id: editing.id, input: toApiInput(values) });
       toast.success(`Updated ${values.name}`);
       setEditing(null);
+      clearEditParam();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to update");
     }
@@ -146,7 +165,7 @@ export function PeoplePage() {
                 <TableHead>Department</TableHead>
                 <TableHead>Labels</TableHead>
                 <TableHead className="w-20">Active</TableHead>
-                <TableHead className="w-32 text-right">Actions</TableHead>
+                <TableHead className="w-40 text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -190,10 +209,16 @@ export function PeoplePage() {
                     )}
                   </TableCell>
                   <TableCell className="text-right space-x-1">
+                    <Button size="icon" variant="ghost" asChild title="Availability">
+                      <Link to={`/availability?personId=${person.id}`}>
+                        <CalendarOff className="size-4" />
+                      </Link>
+                    </Button>
                     <Button
                       size="icon"
                       variant="ghost"
                       onClick={() => setEditing(person)}
+                      title="Edit"
                     >
                       <Pencil className="size-4" />
                     </Button>
@@ -201,6 +226,7 @@ export function PeoplePage() {
                       size="icon"
                       variant="ghost"
                       onClick={() => setDeleting(person)}
+                      title="Delete"
                     >
                       <Trash2 className="size-4" />
                     </Button>
@@ -212,7 +238,15 @@ export function PeoplePage() {
         </div>
       )}
 
-      <Dialog open={!!editing} onOpenChange={(open) => !open && setEditing(null)}>
+      <Dialog
+        open={!!editing}
+        onOpenChange={(open) => {
+          if (!open) {
+            setEditing(null);
+            clearEditParam();
+          }
+        }}
+      >
         <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Edit person</DialogTitle>
