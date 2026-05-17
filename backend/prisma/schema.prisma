@@ -97,6 +97,7 @@ enum AssignmentStatus {
   proposed
   confirmed
   conflict
+  declined
 }
 
 model Assignment {

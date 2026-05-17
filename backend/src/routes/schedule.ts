@@ -55,6 +55,7 @@ scheduleRouter.get(
     const { from, to } = req.query;
     const assignments = await prisma.assignment.findMany({
       where: {
+        status: { not: "declined" },
         event:
           from || to
             ? {
@@ -106,6 +107,14 @@ scheduleRouter.post(
       },
     });
 
+    // 3b. Gather declined (event, person) pairs for events in range — solver
+    // must exclude these from consideration.
+    const eventIdsInRange = events.map((e) => e.id);
+    const declined = await prisma.assignment.findMany({
+      where: { eventId: { in: eventIdsInRange }, status: "declined" },
+      select: { eventId: true, personId: true },
+    });
+
     // 4. Build solver payload.
     const solverPayload = {
       people: people.map((p) => ({
@@ -129,6 +138,10 @@ scheduleRouter.post(
         end: a.endDateTime.toISOString(),
         type: a.type,
       })),
+      declined_pairs: declined.map((d) => ({
+        event_id: d.eventId,
+        person_id: d.personId,
+      })),
       time_limit_seconds: timeLimitSeconds ?? 10,
     };
 
@@ -150,12 +163,11 @@ scheduleRouter.post(
       throw new HttpError(502, `Scheduler unreachable: ${(err as Error).message}`);
     }
 
-    // 6. Persist: drop existing proposed assignments for these events,
-    //    then insert the new ones.
-    const eventIds = events.map((e) => e.id);
-    if (eventIds.length > 0) {
+    // 6. Persist: drop existing proposed assignments for these events
+    //    (confirmed and declined survive), then insert the solver's new picks.
+    if (eventIdsInRange.length > 0) {
       await prisma.assignment.deleteMany({
-        where: { eventId: { in: eventIds }, status: "proposed" },
+        where: { eventId: { in: eventIdsInRange }, status: "proposed" },
       });
     }
 
@@ -170,13 +182,14 @@ scheduleRouter.post(
       });
     }
 
-    // 7. Return assignments hydrated with event + person info.
+    // 7. Return assignments hydrated with event + person info. Declined rows
+    // are excluded from the UI list — they exist purely as solver constraints.
     const hydrated = await prisma.assignment.findMany({
-      where: { eventId: { in: eventIds } },
-      include: {
-        event: { select: { id: true, title: true, startDateTime: true, endDateTime: true, priorityTier: true } },
-        person: { select: { id: true, name: true, email: true } },
+      where: {
+        eventId: { in: eventIdsInRange },
+        status: { not: "declined" },
       },
+      include: assignmentIncludeForResponse,
       orderBy: { event: { startDateTime: "asc" } },
     });
 
@@ -293,5 +306,233 @@ scheduleRouter.delete(
 
     await prisma.assignment.delete({ where: { id: assignment.id } });
     res.status(204).end();
+  }),
+);
+
+const declineSchema = z.object({
+  replacementPersonId: z.string().optional(),
+});
+
+scheduleRouter.post(
+  "/assignments/:id/decline",
+  asyncHandler(async (req, res) => {
+    const { replacementPersonId } = declineSchema.parse(req.body);
+
+    const a = await prisma.assignment.findUniqueOrThrow({
+      where: { id: req.params.id },
+      include: {
+        event: { select: { id: true } },
+        person: { select: { email: true } },
+      },
+    });
+
+    const alreadyDeclined = a.status === "declined";
+
+    // If this assignment had been pushed to Outlook, remove the calendar event
+    // first. (Won't fire on already-declined rows since externalEventId is
+    // cleared at decline time.)
+    if (a.status === "confirmed" && a.externalEventId) {
+      try {
+        await deleteCalendarEvent(a.person.email, a.externalEventId);
+      } catch (err) {
+        throw new HttpError(
+          502,
+          `Failed to remove Outlook event: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }
+
+    // Idempotent: flipping an already-declined row is a no-op for the status
+    // but we still want the rest of the handler (replacement creation,
+    // response) to run.
+    if (!alreadyDeclined) {
+      await prisma.assignment.update({
+        where: { id: a.id },
+        data: {
+          status: "declined",
+          externalEventId: null,
+          syncedToOutlookAt: null,
+        },
+      });
+    }
+
+    // If admin picked a replacement, create a new proposed assignment now.
+    // Stays as proposed even when the original was confirmed — admin reviews
+    // and re-syncs.
+    if (replacementPersonId) {
+      try {
+        await prisma.assignment.create({
+          data: {
+            eventId: a.event.id,
+            personId: replacementPersonId,
+            status: "proposed",
+          },
+        });
+      } catch (err) {
+        // (eventId, personId) uniqueness — replacement was already assigned
+        // or declined for this event in the past.
+        const code = (err as { code?: string }).code;
+        if (code === "P2002") {
+          throw new HttpError(
+            409,
+            "That person already has an assignment (or decline) for this event.",
+          );
+        }
+        throw err;
+      }
+    }
+
+    const updated = await prisma.assignment.findMany({
+      where: { eventId: a.event.id, status: { not: "declined" } },
+      include: assignmentIncludeForResponse,
+      orderBy: { event: { startDateTime: "asc" } },
+    });
+
+    res.json({ updatedAssignments: updated });
+  }),
+);
+
+scheduleRouter.get(
+  "/events/:eventId/candidates",
+  asyncHandler(async (req, res) => {
+    const event = await prisma.event.findUniqueOrThrow({
+      where: { id: req.params.eventId },
+      include: { requiredLabels: { select: { id: true } } },
+    });
+    const requiredLabelIds = event.requiredLabels.map((l) => l.id);
+    const eventStart = event.startDateTime;
+    const eventEnd = event.endDateTime;
+
+    // All active people, then narrow to those with every required label.
+    const people = await prisma.person.findMany({
+      where: { active: true },
+      include: { labels: { select: { id: true } } },
+    });
+    const qualified = people.filter((p) => {
+      const owned = new Set(p.labels.map((l) => l.id));
+      return requiredLabelIds.every((rid) => owned.has(rid));
+    });
+    if (qualified.length === 0) {
+      res.json({ candidates: [] });
+      return;
+    }
+
+    const qualifiedIds = qualified.map((p) => p.id);
+
+    // Availability conflicts (PTO / blocked / etc.) overlapping THIS event.
+    const availability = await prisma.availability.findMany({
+      where: {
+        personId: { in: qualifiedIds },
+        startDateTime: { lt: eventEnd },
+        endDateTime: { gt: eventStart },
+      },
+    });
+    const availByPerson = new Map<string, typeof availability>();
+    for (const av of availability) {
+      const arr = availByPerson.get(av.personId) ?? [];
+      arr.push(av);
+      availByPerson.set(av.personId, arr);
+    }
+
+    // Other (non-declined) assignments on events that overlap THIS event.
+    const overlappingAssignments = await prisma.assignment.findMany({
+      where: {
+        personId: { in: qualifiedIds },
+        status: { in: ["proposed", "confirmed"] },
+        eventId: { not: event.id },
+        event: {
+          startDateTime: { lt: eventEnd },
+          endDateTime: { gt: eventStart },
+        },
+      },
+      include: {
+        event: {
+          select: { title: true, startDateTime: true, endDateTime: true },
+        },
+      },
+    });
+    const overlapByPerson = new Map<string, typeof overlappingAssignments>();
+    for (const oa of overlappingAssignments) {
+      const arr = overlapByPerson.get(oa.personId) ?? [];
+      arr.push(oa);
+      overlapByPerson.set(oa.personId, arr);
+    }
+
+    // Already declined for THIS event — surface so admin doesn't try them again.
+    const declinedHere = await prisma.assignment.findMany({
+      where: { eventId: event.id, status: "declined" },
+      select: { personId: true },
+    });
+    const declinedSet = new Set(declinedHere.map((d) => d.personId));
+
+    // Workload signal: total scheduled hours in a 14-day window centered on
+    // this event. Less-loaded candidates rank higher.
+    const windowStart = new Date(eventStart);
+    windowStart.setDate(windowStart.getDate() - 7);
+    const windowEnd = new Date(eventEnd);
+    windowEnd.setDate(windowEnd.getDate() + 7);
+    const windowAssignments = await prisma.assignment.findMany({
+      where: {
+        personId: { in: qualifiedIds },
+        status: { in: ["proposed", "confirmed"] },
+        event: {
+          startDateTime: { lt: windowEnd },
+          endDateTime: { gt: windowStart },
+        },
+      },
+      include: { event: { select: { startDateTime: true, endDateTime: true } } },
+    });
+    const hoursByPerson = new Map<string, number>();
+    for (const wa of windowAssignments) {
+      const hours =
+        (wa.event.endDateTime.getTime() - wa.event.startDateTime.getTime()) /
+        3600000;
+      hoursByPerson.set(
+        wa.personId,
+        (hoursByPerson.get(wa.personId) ?? 0) + hours,
+      );
+    }
+
+    const candidates = qualified.map((p) => {
+      const conflicts = availByPerson.get(p.id) ?? [];
+      const overlaps = overlapByPerson.get(p.id) ?? [];
+      return {
+        person: {
+          id: p.id,
+          name: p.name,
+          email: p.email,
+          department: p.department,
+        },
+        maxHoursPerWeek: p.maxHoursPerWeek,
+        currentHoursIn14DayWindow: hoursByPerson.get(p.id) ?? 0,
+        availabilityConflicts: conflicts.map((av) => ({
+          type: av.type,
+          start: av.startDateTime,
+          end: av.endDateTime,
+        })),
+        overlappingAssignments: overlaps.map((oa) => ({
+          eventTitle: oa.event.title,
+          start: oa.event.startDateTime,
+          end: oa.event.endDateTime,
+        })),
+        previouslyDeclined: declinedSet.has(p.id),
+      };
+    });
+
+    // Unblocked + non-declined first, then by current load asc.
+    candidates.sort((a, b) => {
+      const aBlocked =
+        a.availabilityConflicts.length > 0 ||
+        a.overlappingAssignments.length > 0 ||
+        a.previouslyDeclined;
+      const bBlocked =
+        b.availabilityConflicts.length > 0 ||
+        b.overlappingAssignments.length > 0 ||
+        b.previouslyDeclined;
+      if (aBlocked !== bBlocked) return aBlocked ? 1 : -1;
+      return a.currentHoursIn14DayWindow - b.currentHoursIn14DayWindow;
+    });
+
+    res.json({ candidates });
   }),
 );

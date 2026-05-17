@@ -6,7 +6,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Send,
-  Trash2,
+  UserX,
   Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -35,8 +35,8 @@ import {
 import {
   useGenerateSchedule,
   useConfirmSchedule,
-  useDeleteAssignment,
 } from "@/features/schedule/useSchedule";
+import { DeclineAssignmentDialog } from "@/features/schedule/DeclineAssignmentDialog";
 import { useEvents } from "@/features/events/useEvents";
 import type {
   GenerateScheduleResult,
@@ -132,14 +132,13 @@ export function SchedulePage() {
   const { data: events } = useEvents();
   const generate = useGenerateSchedule();
   const confirmMut = useConfirmSchedule();
-  const deleteMut = useDeleteAssignment();
 
   // Local source of truth for displayed assignments. Initially seeded from the
-  // generate result, then patched by confirm / delete so we don't have to
+  // generate result, then patched by confirm / decline so we don't have to
   // re-run the solver after every mutation.
   const [assignments, setAssignments] = useState<ScheduleAssignment[]>([]);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [deletingAssignment, setDeletingAssignment] =
+  const [decliningAssignment, setDecliningAssignment] =
     useState<ScheduleAssignment | null>(null);
 
   useEffect(() => {
@@ -191,16 +190,40 @@ export function SchedulePage() {
     }
   };
 
-  const onDelete = async () => {
-    if (!deletingAssignment) return;
+  // The decline modal owns its own mutation and returns the updated assignment
+  // list (the affected event's assignments, post-decline + post-replacement-create).
+  // - If admin picked a replacement: patch local state to reflect the swap.
+  //   Don't re-run the solver — that would let it second-guess the admin's pick.
+  // - If admin declined without replacement: re-run the solver so the now-
+  //   uncovered event surfaces in conflicts (and other downstream effects
+  //   recompute).
+  const onDeclineResolved = (
+    updated: ScheduleAssignment[],
+    replaced: boolean,
+  ) => {
+    const eventId = updated[0]?.event.id ?? decliningAssignment?.event.id;
+    if (replaced && eventId) {
+      setAssignments((prev) => {
+        const others = prev.filter((a) => a.event.id !== eventId);
+        return [...others, ...updated].sort(
+          (a, b) =>
+            new Date(a.event.startDateTime).getTime() -
+            new Date(b.event.startDateTime).getTime(),
+        );
+      });
+      return;
+    }
+    // No replacement → regenerate to refresh assignments and conflicts.
     try {
-      const id = deletingAssignment.id;
-      await deleteMut.mutateAsync(id);
-      setAssignments((prev) => prev.filter((a) => a.id !== id));
-      setDeletingAssignment(null);
-      toast.success("Assignment removed");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to remove");
+      const startISO = new Date(startDate).toISOString();
+      const endISO = new Date(endDate).toISOString();
+      generate.mutate({ startDate: startISO, endDate: endISO });
+    } catch {
+      // If regen fails to even start (invalid range etc.), fall back to local
+      // patch so the declined row at least disappears from the UI.
+      if (eventId) {
+        setAssignments((prev) => prev.filter((a) => a.event.id !== eventId));
+      }
     }
   };
 
@@ -399,14 +422,14 @@ export function SchedulePage() {
                             <Button
                               size="icon"
                               variant="ghost"
-                              onClick={() => setDeletingAssignment(a)}
+                              onClick={() => setDecliningAssignment(a)}
                               title={
                                 a.status === "confirmed"
-                                  ? "Remove assignment AND its Outlook event"
-                                  : "Remove this proposed assignment"
+                                  ? "Decline (removes Outlook event) and optionally pick a replacement"
+                                  : "Decline and optionally pick a replacement"
                               }
                             >
-                              <Trash2 className="size-4" />
+                              <UserX className="size-4" />
                             </Button>
                           </TableCell>
                         </TableRow>
@@ -509,32 +532,11 @@ export function SchedulePage() {
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog
-        open={!!deletingAssignment}
-        onOpenChange={(open) => !open && setDeletingAssignment(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Remove {deletingAssignment?.person.name} from "
-              {deletingAssignment?.event.title}"?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {deletingAssignment?.status === "confirmed"
-                ? "This will also delete the corresponding event from their Outlook calendar."
-                : "This will remove this proposed assignment. Re-generate the schedule to repick."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMut.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction onClick={onDelete} disabled={deleteMut.isPending}>
-              {deleteMut.isPending ? "Removing…" : "Remove"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <DeclineAssignmentDialog
+        assignment={decliningAssignment}
+        onClose={() => setDecliningAssignment(null)}
+        onResolved={onDeclineResolved}
+      />
     </div>
   );
 }

@@ -33,7 +33,12 @@ from .models import (
 TIER_BASE_WEIGHT = 100_000
 HARD_REQUIREMENT_MULTIPLIER = 10
 EXCESS_HOUR_WEIGHT = 50
-WORKLOAD_VARIANCE_WEIGHT = 10
+# Weight per minute of the worst-case (max) workload across people who are
+# eligible for at least one event. Minimizing the max naturally distributes
+# load: assigning to an already-loaded person increases the objective by
+# (duration * MAX_LOAD_WEIGHT), so the solver prefers a less-loaded candidate
+# when one is qualified and available.
+MAX_LOAD_WEIGHT = 10
 
 
 def _events_overlap(a: EventInput, b: EventInput) -> bool:
@@ -94,12 +99,24 @@ def solve(request: SolveRequest) -> SolveResponse:
     for av in availability:
         availability_by_person[av.person_id].append(av)
 
+    # Declined (event, person) pairs the admin has explicitly rejected. These
+    # are excluded just like unqualified pairs — we simply don't create the var.
+    declined_set: set[tuple[int, int]] = set()
+    for d in request.declined_pairs:
+        ei = event_index.get(d.event_id)
+        pi = person_index.get(d.person_id)
+        if ei is not None and pi is not None:
+            declined_set.add((ei, pi))
+
     # x[e, p] = 1 iff person p is assigned to event e. Only create the var if
-    # the person is qualified AND not blocked — otherwise treat as fixed-zero.
+    # the person is qualified, not blocked by availability, and not declined.
+    # Anything else is effectively a fixed-zero (don't model it).
     x: dict[tuple[int, int], cp_model.IntVar] = {}
     for ei, event in enumerate(events):
         for pi, person in enumerate(people):
             if not _person_qualified(person, event):
+                continue
+            if (ei, pi) in declined_set:
                 continue
             if any(
                 _availability_blocks_event(av, event)
@@ -165,25 +182,27 @@ def solve(request: SolveRequest) -> SolveResponse:
             excess_terms.append(excess)
             excess_weights.append(EXCESS_HOUR_WEIGHT)
 
-    # Soft: workload variance — penalize spread = max(hours) - min(hours).
-    spread_terms: list[cp_model.IntVar] = []
-    spread_weights: list[int] = []
-    if len(hours_var_by_person) >= 2:
+    # Soft: workload balance — minimize the worst-case (max) hours across
+    # people who have at least one possible assignment. Excluding people with
+    # no possible vars matters: otherwise admins/receptionists with 0 possible
+    # assignments would pull a hypothetical "min" down and the old spread
+    # objective became meaningless. Minimizing max naturally spreads load
+    # because each additional minute on the heaviest person increases the
+    # objective by exactly MAX_LOAD_WEIGHT.
+    max_load_terms: list[cp_model.IntVar] = []
+    max_load_weights: list[int] = []
+    if hours_var_by_person:
         total_minutes_upper = sum(_event_duration_minutes(e) for e in events) or 1
-        hmax = model.NewIntVar(0, total_minutes_upper, "hmax")
-        hmin = model.NewIntVar(0, total_minutes_upper, "hmin")
+        max_load = model.NewIntVar(0, total_minutes_upper, "max_load")
         for v in hours_var_by_person.values():
-            model.Add(hmax >= v)
-            model.Add(hmin <= v)
-        spread = model.NewIntVar(0, total_minutes_upper, "spread")
-        model.Add(spread == hmax - hmin)
-        spread_terms.append(spread)
-        spread_weights.append(WORKLOAD_VARIANCE_WEIGHT)
+            model.Add(max_load >= v)
+        max_load_terms.append(max_load)
+        max_load_weights.append(MAX_LOAD_WEIGHT)
 
     objective_terms = (
         [w * t for w, t in zip(shortfall_weights, shortfall_terms)]
         + [w * t for w, t in zip(excess_weights, excess_terms)]
-        + [w * t for w, t in zip(spread_weights, spread_terms)]
+        + [w * t for w, t in zip(max_load_weights, max_load_terms)]
     )
     if objective_terms:
         model.Minimize(sum(objective_terms))

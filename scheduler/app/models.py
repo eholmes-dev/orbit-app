@@ -38,10 +38,19 @@ class AvailabilityWindow(BaseModel):
     type: AvailabilityType
 
 
+class DeclinedPair(BaseModel):
+    """(event, person) pair the admin has explicitly declined.
+    Hard constraint — the solver will never propose this assignment."""
+
+    event_id: str
+    person_id: str
+
+
 class SolveRequest(BaseModel):
     people: list[PersonInput]
     events: list[EventInput]
     availability: list[AvailabilityWindow] = Field(default_factory=list)
+    declined_pairs: list[DeclinedPair] = Field(default_factory=list)
     time_limit_seconds: int = Field(default=10, ge=1, le=120)
 
 
