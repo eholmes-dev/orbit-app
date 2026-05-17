@@ -1,6 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Play, AlertTriangle, AlertCircle, CheckCircle2 } from "lucide-react";
+import {
+  Play,
+  AlertTriangle,
+  AlertCircle,
+  CheckCircle2,
+  Send,
+  Trash2,
+  Loader2,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,9 +22,28 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useGenerateSchedule } from "@/features/schedule/useSchedule";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  useGenerateSchedule,
+  useConfirmSchedule,
+  useDeleteAssignment,
+} from "@/features/schedule/useSchedule";
 import { useEvents } from "@/features/events/useEvents";
-import type { GenerateScheduleResult, ScheduleAssignment, ConflictReason } from "@/lib/types";
+import type {
+  GenerateScheduleResult,
+  ScheduleAssignment,
+  ConflictReason,
+  AssignmentStatus,
+} from "@/lib/types";
 
 function todayLocal(): string {
   const d = new Date();
@@ -36,10 +63,9 @@ function localStr(d: Date, time: "00:00" | "23:59"): string {
   return new Date(d.getTime() - tz).toISOString().slice(0, 10) + "T" + time;
 }
 
-// Monday-start week containing `from`.
 function thisWeekRange(from: Date = new Date()): [string, string] {
   const start = new Date(from);
-  const day = start.getDay(); // 0=Sun..6=Sat
+  const day = start.getDay();
   const mondayOffset = day === 0 ? -6 : 1 - day;
   start.setDate(start.getDate() + mondayOffset);
   const end = new Date(start);
@@ -86,17 +112,47 @@ function groupByDay(assignments: ScheduleAssignment[]) {
   );
 }
 
+function statusBadge(status: AssignmentStatus) {
+  if (status === "confirmed") {
+    return (
+      <Badge className="bg-green-600 hover:bg-green-600">
+        <CheckCircle2 className="size-3 mr-1" /> Synced
+      </Badge>
+    );
+  }
+  if (status === "conflict") {
+    return <Badge variant="destructive">Conflict</Badge>;
+  }
+  return <Badge variant="secondary">Proposed</Badge>;
+}
+
 export function SchedulePage() {
   const [startDate, setStartDate] = useState(todayLocal());
   const [endDate, setEndDate] = useState(plusDaysLocal(30));
   const { data: events } = useEvents();
   const generate = useGenerateSchedule();
+  const confirmMut = useConfirmSchedule();
+  const deleteMut = useDeleteAssignment();
+
+  // Local source of truth for displayed assignments. Initially seeded from the
+  // generate result, then patched by confirm / delete so we don't have to
+  // re-run the solver after every mutation.
+  const [assignments, setAssignments] = useState<ScheduleAssignment[]>([]);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [deletingAssignment, setDeletingAssignment] =
+    useState<ScheduleAssignment | null>(null);
+
+  useEffect(() => {
+    if (generate.data?.assignments) {
+      setAssignments(generate.data.assignments);
+    }
+  }, [generate.data]);
 
   const result: GenerateScheduleResult | undefined = generate.data;
-
-  const grouped = useMemo(
-    () => (result ? groupByDay(result.assignments) : []),
-    [result],
+  const grouped = useMemo(() => groupByDay(assignments), [assignments]);
+  const proposedCount = useMemo(
+    () => assignments.filter((a) => a.status === "proposed").length,
+    [assignments],
   );
 
   const eventTitleById = useMemo(() => {
@@ -116,13 +172,45 @@ export function SchedulePage() {
     }
   };
 
+  const onConfirm = async () => {
+    try {
+      const res = await confirmMut.mutateAsync({});
+      // Patch local assignments with the updated rows.
+      const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
+      setAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
+      setConfirmOpen(false);
+      if (res.failed > 0) {
+        toast.warning(
+          `${res.confirmed} synced to Outlook, ${res.failed} failed. Check details below.`,
+        );
+      } else {
+        toast.success(`Synced ${res.confirmed} events to Outlook`);
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Confirm failed");
+    }
+  };
+
+  const onDelete = async () => {
+    if (!deletingAssignment) return;
+    try {
+      const id = deletingAssignment.id;
+      await deleteMut.mutateAsync(id);
+      setAssignments((prev) => prev.filter((a) => a.id !== id));
+      setDeletingAssignment(null);
+      toast.success("Assignment removed");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to remove");
+    }
+  };
+
   return (
     <div className="p-8 max-w-6xl mx-auto space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Schedule</h1>
         <p className="text-sm text-muted-foreground">
-          Generate a proposed schedule for a date range. Conflicts and warnings
-          surface below — review before locking and syncing (Phase 3).
+          Generate a proposed schedule for a date range, review conflicts, then
+          confirm to push assignments to staff Outlook calendars.
         </p>
       </div>
 
@@ -240,15 +328,39 @@ export function SchedulePage() {
             />
           </div>
 
+          {proposedCount > 0 && (
+            <div className="flex items-center justify-between border rounded-lg bg-card p-4">
+              <div>
+                <div className="font-medium">
+                  {proposedCount} proposed assignment{proposedCount === 1 ? "" : "s"} pending
+                </div>
+                <p className="text-sm text-muted-foreground mt-0.5">
+                  Confirm to push events onto each staff member's Outlook calendar.
+                </p>
+              </div>
+              <Button
+                onClick={() => setConfirmOpen(true)}
+                disabled={confirmMut.isPending}
+              >
+                {confirmMut.isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Send className="size-4" />
+                )}
+                {confirmMut.isPending ? "Syncing…" : "Confirm & sync to Outlook"}
+              </Button>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div className="lg:col-span-2 space-y-4">
-              <h2 className="text-lg font-medium">Proposed assignments</h2>
+              <h2 className="text-lg font-medium">Assignments</h2>
               {grouped.length === 0 && (
                 <p className="text-sm text-muted-foreground">
                   No assignments were made in this range.
                 </p>
               )}
-              {grouped.map(([day, assignments]) => (
+              {grouped.map(([day, dayAssignments]) => (
                 <div key={day} className="border rounded-lg bg-card">
                   <div className="px-4 py-2 border-b text-sm font-medium bg-muted/40">
                     {day}
@@ -260,10 +372,12 @@ export function SchedulePage() {
                         <TableHead>When</TableHead>
                         <TableHead className="w-16">Tier</TableHead>
                         <TableHead>Person</TableHead>
+                        <TableHead className="w-28">Status</TableHead>
+                        <TableHead className="w-16" />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {assignments.map((a) => (
+                      {dayAssignments.map((a) => (
                         <TableRow key={a.id}>
                           <TableCell className="font-medium">{a.event.title}</TableCell>
                           <TableCell className="text-sm text-muted-foreground">
@@ -279,6 +393,21 @@ export function SchedulePage() {
                             >
                               {a.person.name}
                             </Link>
+                          </TableCell>
+                          <TableCell>{statusBadge(a.status)}</TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => setDeletingAssignment(a)}
+                              title={
+                                a.status === "confirmed"
+                                  ? "Remove assignment AND its Outlook event"
+                                  : "Remove this proposed assignment"
+                              }
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
                           </TableCell>
                         </TableRow>
                       ))}
@@ -353,6 +482,59 @@ export function SchedulePage() {
           </div>
         </>
       )}
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Push {proposedCount} event{proposedCount === 1 ? "" : "s"} to Outlook?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This creates a calendar event on each assigned staff member's
+              Outlook calendar. Staff will see the event immediately.
+              <br />
+              <br />
+              Already-confirmed assignments are skipped. Per-assignment failures
+              don't block the rest of the batch.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={confirmMut.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={onConfirm} disabled={confirmMut.isPending}>
+              {confirmMut.isPending ? "Syncing…" : "Confirm & sync"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={!!deletingAssignment}
+        onOpenChange={(open) => !open && setDeletingAssignment(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Remove {deletingAssignment?.person.name} from "
+              {deletingAssignment?.event.title}"?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {deletingAssignment?.status === "confirmed"
+                ? "This will also delete the corresponding event from their Outlook calendar."
+                : "This will remove this proposed assignment. Re-generate the schedule to repick."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteMut.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={onDelete} disabled={deleteMut.isPending}>
+              {deleteMut.isPending ? "Removing…" : "Remove"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -1,11 +1,29 @@
 import { Router } from "express";
+import { z } from "zod";
 import { prisma } from "../db.js";
 import { asyncHandler, HttpError } from "../middleware/error.js";
 import { generateScheduleSchema } from "../schemas/schedule.js";
+import {
+  createCalendarEvent,
+  deleteCalendarEvent,
+} from "../lib/graph.js";
 
 export const scheduleRouter = Router();
 
 const SCHEDULER_URL = process.env.SCHEDULER_URL ?? "http://localhost:8000";
+
+const assignmentIncludeForResponse = {
+  event: {
+    select: {
+      id: true,
+      title: true,
+      startDateTime: true,
+      endDateTime: true,
+      priorityTier: true,
+    },
+  },
+  person: { select: { id: true, name: true, email: true } },
+} as const;
 
 interface SolverAssignment {
   event_id: string;
@@ -176,5 +194,104 @@ scheduleRouter.post(
       conflicts: solverResult.conflicts,
       warnings: solverResult.warnings,
     });
+  }),
+);
+
+const confirmSchema = z.object({
+  assignmentIds: z.array(z.string()).optional(),
+});
+
+scheduleRouter.post(
+  "/confirm",
+  asyncHandler(async (req, res) => {
+    const { assignmentIds } = confirmSchema.parse(req.body);
+
+    const proposed = await prisma.assignment.findMany({
+      where: {
+        status: "proposed",
+        ...(assignmentIds ? { id: { in: assignmentIds } } : {}),
+      },
+      include: assignmentIncludeForResponse,
+    });
+
+    const results: Array<{
+      assignmentId: string;
+      status: "confirmed" | "failed";
+      error?: string;
+    }> = [];
+
+    for (const a of proposed) {
+      try {
+        const bodyText =
+          `Tier ${a.event.priorityTier} shift.\n` +
+          `Assigned to ${a.person.name} by Orbit Scheduler.`;
+        const externalEventId = await createCalendarEvent(a.person.email, {
+          subject: a.event.title,
+          start: a.event.startDateTime,
+          end: a.event.endDateTime,
+          bodyText,
+        });
+        await prisma.assignment.update({
+          where: { id: a.id },
+          data: {
+            status: "confirmed",
+            externalEventId,
+            syncedToOutlookAt: new Date(),
+          },
+        });
+        results.push({ assignmentId: a.id, status: "confirmed" });
+      } catch (err) {
+        results.push({
+          assignmentId: a.id,
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Return the affected assignments hydrated with their new status so the
+    // frontend can patch its local view without re-running the solver.
+    const updatedAssignments = await prisma.assignment.findMany({
+      where: { id: { in: proposed.map((p) => p.id) } },
+      include: assignmentIncludeForResponse,
+      orderBy: { event: { startDateTime: "asc" } },
+    });
+
+    res.json({
+      confirmed: results.filter((r) => r.status === "confirmed").length,
+      failed: results.filter((r) => r.status === "failed").length,
+      results,
+      updatedAssignments,
+    });
+  }),
+);
+
+scheduleRouter.delete(
+  "/assignments/:id",
+  asyncHandler(async (req, res) => {
+    const assignment = await prisma.assignment.findUniqueOrThrow({
+      where: { id: req.params.id },
+      include: { person: { select: { email: true } } },
+    });
+
+    // If this assignment had been pushed to Outlook, remove the calendar event
+    // first. If that fails we don't delete the DB row — admin needs to retry
+    // or clean up manually.
+    if (assignment.status === "confirmed" && assignment.externalEventId) {
+      try {
+        await deleteCalendarEvent(
+          assignment.person.email,
+          assignment.externalEventId,
+        );
+      } catch (err) {
+        throw new HttpError(
+          502,
+          `Failed to remove Outlook event: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }
+
+    await prisma.assignment.delete({ where: { id: assignment.id } });
+    res.status(204).end();
   }),
 );
