@@ -1,0 +1,114 @@
+// Orbit — healthcare scheduling app
+// Full Phase 1 schema. Only Person and Label have UIs in Phase 1,
+// but defining everything now avoids painful migrations in Phase 2.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Person {
+  id               String         @id @default(cuid())
+  name             String
+  email            String         @unique
+  department       String?
+  active           Boolean        @default(true)
+  maxHoursPerWeek  Int?
+  preferredHours   Int?
+  outlookAccountId String?
+  labels           Label[]        @relation("PersonLabels")
+  availability     Availability[]
+  assignments      Assignment[]
+  blackoutDates    BlackoutDate[]
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+}
+
+model Label {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  description String?
+  people      Person[] @relation("PersonLabels")
+  events      Event[]  @relation("EventLabels")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Event {
+  id                 String       @id @default(cuid())
+  title              String
+  startDateTime      DateTime
+  endDateTime        DateTime
+  priorityTier       Int
+  requiredStaffCount Int          @default(1)
+  isHardRequirement  Boolean      @default(false)
+  recurrenceRule     String?
+  location           String?
+  requiredLabels     Label[]      @relation("EventLabels")
+  assignments        Assignment[]
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+}
+
+enum AvailabilityType {
+  vacation
+  PTO
+  appointment
+  blocked
+  recurring
+}
+
+enum AvailabilitySource {
+  manual
+  outlook_sync
+}
+
+model Availability {
+  id              String             @id @default(cuid())
+  personId        String
+  person          Person             @relation(fields: [personId], references: [id], onDelete: Cascade)
+  type            AvailabilityType
+  startDateTime   DateTime
+  endDateTime     DateTime
+  source          AvailabilitySource @default(manual)
+  externalEventId String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  @@index([personId, startDateTime, endDateTime])
+}
+
+model BlackoutDate {
+  id       String   @id @default(cuid())
+  personId String
+  person   Person   @relation(fields: [personId], references: [id], onDelete: Cascade)
+  date     DateTime
+  reason   String?
+
+  @@unique([personId, date])
+}
+
+enum AssignmentStatus {
+  proposed
+  confirmed
+  conflict
+}
+
+model Assignment {
+  id                String           @id @default(cuid())
+  eventId           String
+  event             Event            @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  personId          String
+  person            Person           @relation(fields: [personId], references: [id], onDelete: Cascade)
+  status            AssignmentStatus @default(proposed)
+  syncedToOutlookAt DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@unique([eventId, personId])
+}

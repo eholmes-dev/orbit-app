@@ -1,0 +1,17 @@
+{
+  "name": "orbit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Healthcare scheduling app with constraint-based scheduler and Outlook sync",
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev:backend": "npm --workspace backend run dev",
+    "dev:frontend": "npm --workspace frontend run dev",
+    "db:migrate": "npm --workspace=backend run prisma:migrate --",
+    "db:studio": "npm --workspace=backend run prisma:studio",
+    "db:generate": "npm --workspace=backend run prisma:generate"
+  }
+}
