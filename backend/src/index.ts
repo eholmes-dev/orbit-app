@@ -7,6 +7,7 @@ import { labelsRouter } from "./routes/labels.js";
 import { eventsRouter } from "./routes/events.js";
 import { availabilityRouter } from "./routes/availability.js";
 import { scheduleRouter } from "./routes/schedule.js";
+import { overrideRouter } from "./routes/override.js";
 import { authRouter } from "./routes/auth.js";
 import { sessionMiddleware, requireAuth } from "./middleware/session.js";
 import { errorHandler, notFoundHandler } from "./middleware/error.js";
@@ -30,6 +31,8 @@ app.get("/api/health", async (_req, res) => {
 });
 
 app.use("/api/auth", authRouter);
+// Public — email recipients aren't signed in; URL token is the bearer secret.
+app.use("/api/override", overrideRouter);
 
 // Everything below requires a valid session.
 app.use("/api/people", requireAuth, peopleRouter);

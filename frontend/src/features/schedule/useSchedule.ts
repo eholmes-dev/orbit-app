@@ -33,6 +33,24 @@ export function useConfirmSchedule() {
   });
 }
 
+export interface UnconfirmResult {
+  unconfirmed: number;
+  failed: number;
+  results: Array<{
+    assignmentId: string;
+    status: "unconfirmed" | "failed";
+    error?: string;
+  }>;
+  updatedAssignments: ScheduleAssignment[];
+}
+
+export function useUnconfirmAssignments() {
+  return useMutation({
+    mutationFn: (input: { assignmentIds: string[] }) =>
+      api.post<UnconfirmResult>("/api/schedule/unconfirm", input),
+  });
+}
+
 export function useDeleteAssignment() {
   return useMutation({
     mutationFn: (id: string) => api.delete<void>(`/api/schedule/assignments/${id}`),
@@ -75,6 +93,19 @@ export interface Candidate {
     end: string;
   }>;
   previouslyDeclined: boolean;
+  pendingOverrideRequest: { id: string; sentAt: string } | null;
+}
+
+export interface CandidatesResponse {
+  event: {
+    id: string;
+    title: string;
+    startDateTime: string;
+    endDateTime: string;
+    requiredStaffCount: number;
+  };
+  currentAssignments: ScheduleAssignment[];
+  candidates: Candidate[];
 }
 
 export function useEventCandidates(eventId: string | null) {
@@ -82,9 +113,19 @@ export function useEventCandidates(eventId: string | null) {
     enabled: !!eventId,
     queryKey: ["schedule", "candidates", eventId] as const,
     queryFn: () =>
-      api.get<{ candidates: Candidate[] }>(
+      api.get<CandidatesResponse>(
         `/api/schedule/events/${eventId}/candidates`,
       ),
+    // Auto-poll every 5s while there's at least one pending override request,
+    // so the dialog reflects the recipient's accept/decline without an admin
+    // refresh. Once nothing is pending, polling stops on the next tick.
+    refetchInterval: (query) => {
+      const data = query.state.data as CandidatesResponse | undefined;
+      const hasPending = data?.candidates.some(
+        (c) => c.pendingOverrideRequest !== null,
+      );
+      return hasPending ? 5000 : false;
+    },
   });
 }
 
@@ -112,6 +153,31 @@ export function useMoveAssignment() {
         fromEventId: string;
         toEventId: string;
       }>(`/api/schedule/assignments/${fromAssignmentId}/move`, { toEventId }),
+  });
+}
+
+export interface OverrideRequestResult {
+  id: string;
+  sentTo: string;
+  sentAt: string;
+  expiresAt: string;
+}
+
+export function useRequestOverride() {
+  return useMutation({
+    mutationFn: ({
+      eventId,
+      personId,
+      message,
+    }: {
+      eventId: string;
+      personId: string;
+      message?: string;
+    }) =>
+      api.post<OverrideRequestResult>(
+        `/api/schedule/events/${eventId}/request-override`,
+        { personId, message },
+      ),
   });
 }
 

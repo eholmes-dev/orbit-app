@@ -1,5 +1,6 @@
 import { Routes, Route, Navigate, Outlet, useLocation } from "react-router-dom";
 import { Shell } from "@/components/layout/Shell";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PeoplePage } from "@/pages/PeoplePage";
 import { LabelsPage } from "@/pages/LabelsPage";
 import { EventsPage } from "@/pages/EventsPage";
@@ -28,19 +29,21 @@ function RequireAuth() {
 
 export default function App() {
   return (
-    <Routes>
-      <Route path="/login" element={<LoginPage />} />
-      <Route element={<RequireAuth />}>
-        <Route element={<Shell />}>
-          <Route index element={<Navigate to="/schedule" replace />} />
-          <Route path="/schedule" element={<SchedulePage />} />
-          <Route path="/people" element={<PeoplePage />} />
-          <Route path="/labels" element={<LabelsPage />} />
-          <Route path="/events" element={<EventsPage />} />
-          <Route path="/availability" element={<AvailabilityPage />} />
-          <Route path="/archive" element={<ArchivePage />} />
+    <ErrorBoundary>
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route element={<RequireAuth />}>
+          <Route element={<Shell />}>
+            <Route index element={<Navigate to="/schedule" replace />} />
+            <Route path="/schedule" element={<SchedulePage />} />
+            <Route path="/people" element={<PeoplePage />} />
+            <Route path="/labels" element={<LabelsPage />} />
+            <Route path="/events" element={<EventsPage />} />
+            <Route path="/availability" element={<AvailabilityPage />} />
+            <Route path="/archive" element={<ArchivePage />} />
+          </Route>
         </Route>
-      </Route>
-    </Routes>
+      </Routes>
+    </ErrorBoundary>
   );
 }

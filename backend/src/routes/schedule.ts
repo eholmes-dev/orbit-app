@@ -3,9 +3,11 @@ import { z } from "zod";
 import { prisma } from "../db.js";
 import { asyncHandler, HttpError } from "../middleware/error.js";
 import { generateScheduleSchema } from "../schemas/schedule.js";
+import { randomBytes } from "node:crypto";
 import {
   createCalendarEvent,
   deleteCalendarEvent,
+  sendMail,
 } from "../lib/graph.js";
 
 export const scheduleRouter = Router();
@@ -282,6 +284,70 @@ scheduleRouter.post(
   }),
 );
 
+const unconfirmSchema = z.object({
+  assignmentIds: z.array(z.string()).min(1).max(200),
+});
+
+// Roll back a previous Confirm & sync. For each given assignment:
+//   - if confirmed AND has externalEventId, delete the Outlook event first
+//   - flip status back to proposed and clear externalEventId/syncedToOutlookAt
+// Per-assignment failure handling matches /confirm: one bad Outlook delete
+// doesn't block the rest of the batch.
+scheduleRouter.post(
+  "/unconfirm",
+  asyncHandler(async (req, res) => {
+    const { assignmentIds } = unconfirmSchema.parse(req.body);
+
+    const confirmed = await prisma.assignment.findMany({
+      where: { id: { in: assignmentIds }, status: "confirmed" },
+      include: { person: { select: { email: true } } },
+    });
+
+    const results: Array<{
+      assignmentId: string;
+      status: "unconfirmed" | "failed";
+      error?: string;
+    }> = [];
+
+    for (const a of confirmed) {
+      if (a.externalEventId) {
+        try {
+          await deleteCalendarEvent(a.person.email, a.externalEventId);
+        } catch (err) {
+          results.push({
+            assignmentId: a.id,
+            status: "failed",
+            error: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+      }
+      await prisma.assignment.update({
+        where: { id: a.id },
+        data: {
+          status: "proposed",
+          externalEventId: null,
+          syncedToOutlookAt: null,
+        },
+      });
+      results.push({ assignmentId: a.id, status: "unconfirmed" });
+    }
+
+    const updatedAssignments = await prisma.assignment.findMany({
+      where: { id: { in: assignmentIds } },
+      include: assignmentIncludeForResponse,
+      orderBy: { event: { startDateTime: "asc" } },
+    });
+
+    res.json({
+      unconfirmed: results.filter((r) => r.status === "unconfirmed").length,
+      failed: results.filter((r) => r.status === "failed").length,
+      results,
+      updatedAssignments,
+    });
+  }),
+);
+
 scheduleRouter.delete(
   "/assignments/:id",
   asyncHandler(async (req, res) => {
@@ -486,6 +552,20 @@ scheduleRouter.get(
     });
     const declinedSet = new Set(declinedHere.map((d) => d.personId));
 
+    // Pending override requests for this event — admin shouldn't re-send.
+    const pendingOverrides = await prisma.overrideRequest.findMany({
+      where: {
+        eventId: event.id,
+        personId: { in: qualifiedIds },
+        status: "pending",
+        expiresAt: { gt: new Date() },
+      },
+      select: { id: true, personId: true, createdAt: true },
+    });
+    const pendingByPerson = new Map(
+      pendingOverrides.map((r) => [r.personId, r]),
+    );
+
     // Workload signal: total scheduled hours in a 14-day window centered on
     // this event. Less-loaded candidates rank higher.
     const windowStart = new Date(eventStart);
@@ -517,6 +597,7 @@ scheduleRouter.get(
     const candidates = qualified.map((p) => {
       const conflicts = availByPerson.get(p.id) ?? [];
       const overlaps = overlapByPerson.get(p.id) ?? [];
+      const pending = pendingByPerson.get(p.id);
       return {
         person: {
           id: p.id,
@@ -538,6 +619,9 @@ scheduleRouter.get(
           end: oa.event.endDateTime,
         })),
         previouslyDeclined: declinedSet.has(p.id),
+        pendingOverrideRequest: pending
+          ? { id: pending.id, sentAt: pending.createdAt }
+          : null,
       };
     });
 
@@ -555,7 +639,25 @@ scheduleRouter.get(
       return a.currentHoursIn14DayWindow - b.currentHoursIn14DayWindow;
     });
 
-    res.json({ candidates });
+    // Include the event's current active assignments so the polling dialog
+    // can show "Currently assigned" without a separate query.
+    const currentAssignments = await prisma.assignment.findMany({
+      where: { eventId: event.id, status: { not: "declined" } },
+      include: assignmentIncludeForResponse,
+      orderBy: { event: { startDateTime: "asc" } },
+    });
+
+    res.json({
+      event: {
+        id: event.id,
+        title: event.title,
+        startDateTime: event.startDateTime,
+        endDateTime: event.endDateTime,
+        requiredStaffCount: event.requiredStaffCount,
+      },
+      currentAssignments,
+      candidates,
+    });
   }),
 );
 
@@ -863,6 +965,201 @@ scheduleRouter.post(
       orderBy: { event: { startDateTime: "asc" } },
     });
     res.json({ updatedAssignments: updated, fromEventId, toEventId });
+  }),
+);
+
+const requestOverrideSchema = z.object({
+  personId: z.string().min(1),
+  message: z.string().trim().max(2000).optional(),
+});
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatDateTime(d: Date): string {
+  return d.toLocaleString("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function renderOverrideEmail(args: {
+  recipientName: string;
+  eventTitle: string;
+  eventStart: Date;
+  eventEnd: Date;
+  eventLocation: string | null;
+  blockingType: string;
+  blockingStart: Date;
+  blockingEnd: Date;
+  customMessage: string | null;
+  acceptUrl: string;
+  declineUrl: string;
+}): string {
+  const {
+    recipientName,
+    eventTitle,
+    eventStart,
+    eventEnd,
+    eventLocation,
+    blockingType,
+    blockingStart,
+    blockingEnd,
+    customMessage,
+    acceptUrl,
+    declineUrl,
+  } = args;
+  return `<!DOCTYPE html>
+<html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; color: #1f2937;">
+  <h2 style="margin: 0 0 16px;">Coverage request</h2>
+  <p>Hi ${escapeHtml(recipientName)},</p>
+  <p>You're the only qualified person for the following event, but you're currently blocked. Can you cover it?</p>
+  <div style="border: 1px solid #e5e7eb; padding: 16px; border-radius: 8px; margin: 16px 0; background: #f9fafb;">
+    <div style="font-weight: 600; font-size: 16px;">${escapeHtml(eventTitle)}</div>
+    <div style="color: #4b5563; margin-top: 4px;">${escapeHtml(formatDateTime(eventStart))} – ${escapeHtml(formatDateTime(eventEnd))}</div>
+    ${eventLocation ? `<div style="color: #4b5563; margin-top: 4px;">📍 ${escapeHtml(eventLocation)}</div>` : ""}
+  </div>
+  <p>Your conflict: <strong>${escapeHtml(blockingType)}</strong> from ${escapeHtml(formatDateTime(blockingStart))} to ${escapeHtml(formatDateTime(blockingEnd))}.</p>
+  ${customMessage ? `<blockquote style="border-left: 3px solid #d1d5db; padding-left: 12px; margin: 16px 0; color: #4b5563;">${escapeHtml(customMessage)}</blockquote>` : ""}
+  <p style="margin: 24px 0;">
+    <a href="${acceptUrl}" style="background: #10b981; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block; margin-right: 8px; font-weight: 500;">Yes, I'll cover it</a>
+    <a href="${declineUrl}" style="background: #ef4444; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block; font-weight: 500;">No, decline</a>
+  </p>
+  <p style="font-size: 12px; color: #6b7280;">If you accept, your conflicting ${escapeHtml(blockingType)} window will be adjusted to skip this event so the rest of your time off is preserved. This link expires in 7 days.</p>
+  <p style="font-size: 12px; color: #9ca3af; margin-top: 32px;">— Orbit Scheduler</p>
+</body></html>`;
+}
+
+scheduleRouter.post(
+  "/events/:eventId/request-override",
+  asyncHandler(async (req, res) => {
+    if (!req.user) throw new HttpError(401, "Unauthenticated");
+    const { personId, message } = requestOverrideSchema.parse(req.body);
+    const eventId = req.params.eventId;
+
+    const [event, person] = await Promise.all([
+      prisma.event.findUniqueOrThrow({
+        where: { id: eventId },
+        include: { requiredLabels: { select: { id: true, name: true } } },
+      }),
+      prisma.person.findUniqueOrThrow({
+        where: { id: personId },
+        include: { labels: { select: { id: true } } },
+      }),
+    ]);
+    if (event.cancelledAt) {
+      throw new HttpError(409, "Event is cancelled.");
+    }
+
+    // Verify qualified.
+    const personLabels = new Set(person.labels.map((l) => l.id));
+    const missing = event.requiredLabels.filter(
+      (l) => !personLabels.has(l.id),
+    );
+    if (missing.length > 0) {
+      throw new HttpError(
+        409,
+        `${person.name} doesn't have all required labels for this event.`,
+      );
+    }
+
+    // Find the blocking availability (must exist — if there's no block, admin
+    // should just add the person directly).
+    const blocking = await prisma.availability.findFirst({
+      where: {
+        personId,
+        startDateTime: { lt: event.endDateTime },
+        endDateTime: { gt: event.startDateTime },
+      },
+      orderBy: { startDateTime: "asc" },
+    });
+    if (!blocking) {
+      throw new HttpError(
+        400,
+        `${person.name} isn't blocked by availability for this event — just add them directly.`,
+      );
+    }
+
+    // One pending request per (event, person) at a time.
+    const existing = await prisma.overrideRequest.findFirst({
+      where: { eventId, personId, status: "pending" },
+    });
+    if (existing) {
+      throw new HttpError(
+        409,
+        `An override request is already pending for ${person.name}.`,
+      );
+    }
+
+    // Create the request row, then attempt to send the email. If sending fails,
+    // delete the row so the UI doesn't show a phantom pending request.
+    const token = randomBytes(32).toString("hex");
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
+
+    const created = await prisma.overrideRequest.create({
+      data: {
+        token,
+        eventId,
+        personId,
+        blockingType: blocking.type,
+        blockingStart: blocking.startDateTime,
+        blockingEnd: blocking.endDateTime,
+        message: message ?? null,
+        expiresAt,
+      },
+    });
+
+    const publicUrl =
+      process.env.BACKEND_PUBLIC_URL ?? "http://localhost:4000";
+    const acceptUrl = `${publicUrl}/api/override/${token}/accept`;
+    const declineUrl = `${publicUrl}/api/override/${token}/decline`;
+
+    const html = renderOverrideEmail({
+      recipientName: person.name,
+      eventTitle: event.title,
+      eventStart: event.startDateTime,
+      eventEnd: event.endDateTime,
+      eventLocation: event.location,
+      blockingType: blocking.type,
+      blockingStart: blocking.startDateTime,
+      blockingEnd: blocking.endDateTime,
+      customMessage: message ?? null,
+      acceptUrl,
+      declineUrl,
+    });
+
+    try {
+      await sendMail(
+        req.user.email,
+        [person.email],
+        `[Orbit] Cover ${event.title}?`,
+        html,
+      );
+    } catch (err) {
+      await prisma.overrideRequest.delete({ where: { id: created.id } });
+      throw new HttpError(
+        502,
+        `Email failed: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+
+    res.status(201).json({
+      id: created.id,
+      sentTo: person.email,
+      sentAt: created.createdAt,
+      expiresAt: created.expiresAt,
+    });
   }),
 );
 

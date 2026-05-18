@@ -10,11 +10,12 @@ import {
   Loader2,
   Wand2,
   Ban,
+  CloudOff,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { DateTimeInput } from "@/components/DateTimeInput";
 import { Separator } from "@/components/ui/separator";
 import {
   Table,
@@ -37,6 +38,7 @@ import {
 import {
   useGenerateSchedule,
   useConfirmSchedule,
+  useUnconfirmAssignments,
 } from "@/features/schedule/useSchedule";
 import { DeclineAssignmentDialog } from "@/features/schedule/DeclineAssignmentDialog";
 import { CancelConflictDialog } from "@/features/schedule/CancelConflictDialog";
@@ -137,6 +139,7 @@ export function SchedulePage() {
   const { data: events } = useEvents();
   const generate = useGenerateSchedule();
   const confirmMut = useConfirmSchedule();
+  const unconfirmMut = useUnconfirmAssignments();
 
   // Local source of truth for displayed assignments + conflicts. Seeded from
   // the generate result, then patched by confirm / decline / resolve / cancel
@@ -150,6 +153,8 @@ export function SchedulePage() {
     useState<ScheduleConflict | null>(null);
   const [resolvingConflict, setResolvingConflict] =
     useState<ScheduleConflict | null>(null);
+  const [unsyncingAssignment, setUnsyncingAssignment] =
+    useState<ScheduleAssignment | null>(null);
 
   useEffect(() => {
     if (generate.data?.assignments) {
@@ -184,6 +189,30 @@ export function SchedulePage() {
     }
   };
 
+  // Shared unsync: takes a list of assignment IDs, calls the unconfirm
+  // endpoint, patches local state. Used by both the toast Undo affordance
+  // (immediately after Confirm & sync) and the per-row CloudOff button.
+  const runUnconfirm = async (
+    assignmentIds: string[],
+    successMessage: (n: number) => string,
+  ) => {
+    if (assignmentIds.length === 0) return;
+    try {
+      const res = await unconfirmMut.mutateAsync({ assignmentIds });
+      const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
+      setAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
+      if (res.failed > 0) {
+        toast.warning(
+          `${res.unconfirmed} unsynced, ${res.failed} failed. Outlook may be partially out of sync.`,
+        );
+      } else {
+        toast.success(successMessage(res.unconfirmed));
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Unsync failed");
+    }
+  };
+
   const onConfirm = async () => {
     try {
       const res = await confirmMut.mutateAsync({});
@@ -191,16 +220,58 @@ export function SchedulePage() {
       const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
       setAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
       setConfirmOpen(false);
+      // IDs that flipped to confirmed in this batch — what the Undo would target.
+      const justConfirmedIds = res.updatedAssignments
+        .filter((a) => a.status === "confirmed")
+        .map((a) => a.id);
       if (res.failed > 0) {
         toast.warning(
           `${res.confirmed} synced to Outlook, ${res.failed} failed. Check details below.`,
+          {
+            action:
+              justConfirmedIds.length > 0
+                ? {
+                    label: "Undo",
+                    onClick: () =>
+                      runUnconfirm(
+                        justConfirmedIds,
+                        (n) =>
+                          `Rolled back ${n} Outlook event${n === 1 ? "" : "s"}`,
+                      ),
+                  }
+                : undefined,
+            duration: 15_000,
+          },
         );
       } else {
-        toast.success(`Synced ${res.confirmed} events to Outlook`);
+        toast.success(`Synced ${res.confirmed} events to Outlook`, {
+          action:
+            justConfirmedIds.length > 0
+              ? {
+                  label: "Undo",
+                  onClick: () =>
+                    runUnconfirm(
+                      justConfirmedIds,
+                      (n) =>
+                        `Rolled back ${n} Outlook event${n === 1 ? "" : "s"}`,
+                    ),
+                }
+              : undefined,
+          duration: 15_000,
+        });
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Confirm failed");
     }
+  };
+
+  const onUnsyncOne = async () => {
+    if (!unsyncingAssignment) return;
+    await runUnconfirm(
+      [unsyncingAssignment.id],
+      () => `Unsynced — ${unsyncingAssignment.person.name} is back to proposed`,
+    );
+    setUnsyncingAssignment(null);
   };
 
   // After Resolve dialog closes with at least one action taken, patch local
@@ -331,19 +402,11 @@ export function SchedulePage() {
         <div className="flex items-end gap-4">
           <div className="flex-1">
             <label className="text-sm font-medium mb-1.5 block">Start</label>
-            <Input
-              type="datetime-local"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-            />
+            <DateTimeInput value={startDate} onChange={setStartDate} />
           </div>
           <div className="flex-1">
             <label className="text-sm font-medium mb-1.5 block">End</label>
-            <Input
-              type="datetime-local"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
+            <DateTimeInput value={endDate} onChange={setEndDate} />
           </div>
           <Button onClick={onGenerate} disabled={generate.isPending}>
             <Play className="size-4" />
@@ -481,14 +544,24 @@ export function SchedulePage() {
                             </Link>
                           </TableCell>
                           <TableCell>{statusBadge(a.status)}</TableCell>
-                          <TableCell className="text-right">
+                          <TableCell className="text-right space-x-0.5">
+                            {a.status === "confirmed" && (
+                              <Button
+                                size="icon"
+                                variant="ghost"
+                                onClick={() => setUnsyncingAssignment(a)}
+                                title="Unsync from Outlook (revert to proposed). Keeps the assignment, just removes the calendar event."
+                              >
+                                <CloudOff className="size-4" />
+                              </Button>
+                            )}
                             <Button
                               size="icon"
                               variant="ghost"
                               onClick={() => setDecliningAssignment(a)}
                               title={
                                 a.status === "confirmed"
-                                  ? "Decline (removes Outlook event) and optionally pick a replacement"
+                                  ? "Decline (removes Outlook event AND assignment) and optionally pick a replacement"
                                   : "Decline and optionally pick a replacement"
                               }
                             >
@@ -615,6 +688,37 @@ export function SchedulePage() {
         </AlertDialogContent>
       </AlertDialog>
 
+      <AlertDialog
+        open={!!unsyncingAssignment}
+        onOpenChange={(open) => !open && setUnsyncingAssignment(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <CloudOff className="size-5 text-amber-500" />
+              Unsync {unsyncingAssignment?.person.name} from Outlook?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              The calendar event for "{unsyncingAssignment?.event.title}" will
+              be removed from {unsyncingAssignment?.person.name}'s Outlook
+              calendar. The assignment stays as <strong>proposed</strong> in
+              Orbit — you can re-confirm later.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={unconfirmMut.isPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={onUnsyncOne}
+              disabled={unconfirmMut.isPending}
+            >
+              {unconfirmMut.isPending ? "Unsyncing…" : "Unsync"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <DeclineAssignmentDialog
         assignment={decliningAssignment}
         onClose={() => setDecliningAssignment(null)}
@@ -623,13 +727,6 @@ export function SchedulePage() {
 
       <ResolveConflictDialog
         conflict={resolvingConflict}
-        currentAssignments={
-          resolvingConflict
-            ? assignments.filter(
-                (a) => a.event.id === resolvingConflict.event_id,
-              )
-            : []
-        }
         eventTitle={
           resolvingConflict
             ? eventTitleById.get(resolvingConflict.event_id)

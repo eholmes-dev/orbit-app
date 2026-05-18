@@ -117,6 +117,43 @@ export async function createCalendarEvent(
 }
 
 /**
+ * Sends an email via Microsoft Graph using the app-only token. The `fromEmail`
+ * mailbox must exist in the tenant; with Mail.Send Application permission the
+ * app can send AS any user (least surprising option: send as the admin).
+ */
+export async function sendMail(
+  fromEmail: string,
+  to: string[],
+  subject: string,
+  htmlBody: string,
+): Promise<void> {
+  const token = await getAppOnlyToken();
+  const payload = {
+    message: {
+      subject,
+      body: { contentType: "HTML", content: htmlBody },
+      toRecipients: to.map((address) => ({ emailAddress: { address } })),
+    },
+    saveToSentItems: "true",
+  };
+  const res = await fetch(
+    `${GRAPH_BASE}/users/${encodeURIComponent(fromEmail)}/sendMail`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+  // Graph returns 202 Accepted on success.
+  if (!res.ok) {
+    throw new Error(`sendMail failed: ${res.status} ${await res.text()}`);
+  }
+}
+
+/**
  * Deletes a calendar event by its Graph event ID. 404 is treated as success
  * (the event was already gone on Outlook's side).
  */

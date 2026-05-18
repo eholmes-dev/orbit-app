@@ -13,21 +13,22 @@ datasource db {
 }
 
 model Person {
-  id               String         @id @default(cuid())
+  id               String            @id @default(cuid())
   name             String
-  email            String         @unique
+  email            String            @unique
   department       String?
-  active           Boolean        @default(true)
+  active           Boolean           @default(true)
   maxHoursPerWeek  Int?
   preferredHours   Int?
   outlookAccountId String?
-  labels           Label[]        @relation("PersonLabels")
+  labels           Label[]           @relation("PersonLabels")
   availability     Availability[]
   assignments      Assignment[]
   blackoutDates    BlackoutDate[]
   archiveEntries   ArchiveEntry[]
-  createdAt        DateTime       @default(now())
-  updatedAt        DateTime       @updatedAt
+  overrideRequests OverrideRequest[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
 }
 
 model Label {
@@ -41,22 +42,23 @@ model Label {
 }
 
 model Event {
-  id                 String         @id @default(cuid())
+  id                 String            @id @default(cuid())
   title              String
   startDateTime      DateTime
   endDateTime        DateTime
   priorityTier       Int
-  requiredStaffCount Int            @default(1)
-  isHardRequirement  Boolean        @default(false)
+  requiredStaffCount Int               @default(1)
+  isHardRequirement  Boolean           @default(false)
   recurrenceRule     String?
   location           String?
   cancelledAt        DateTime?
   cancellationReason String?
-  requiredLabels     Label[]        @relation("EventLabels")
+  requiredLabels     Label[]           @relation("EventLabels")
   assignments        Assignment[]
   archiveEntries     ArchiveEntry[]
-  createdAt          DateTime       @default(now())
-  updatedAt          DateTime       @updatedAt
+  overrideRequests   OverrideRequest[]
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
 }
 
 enum AvailabilityType {
@@ -146,6 +148,37 @@ model ArchiveEntry {
 
   @@index([createdAt(sort: Desc)])
   @@index([eventId])
+}
+
+enum OverrideRequestStatus {
+  pending
+  accepted
+  declined
+  expired
+}
+
+// An email-based "would you cover this shift?" request sent to a person whose
+// availability blocks them from an event. The token is the bearer secret in
+// the email Accept/Decline URLs (recipient won't be signed in).
+model OverrideRequest {
+  id            String                @id @default(cuid())
+  token         String                @unique
+  eventId       String
+  event         Event                 @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  personId      String
+  person        Person                @relation(fields: [personId], references: [id], onDelete: Cascade)
+  // Snapshot of what was blocking them at request time. Useful for the email
+  // body and for showing the request history later.
+  blockingType  String?
+  blockingStart DateTime?
+  blockingEnd   DateTime?
+  message       String?
+  status        OverrideRequestStatus @default(pending)
+  createdAt     DateTime              @default(now())
+  respondedAt   DateTime?
+  expiresAt     DateTime
+
+  @@index([eventId, personId, status])
 }
 
 // Admin session — created after Microsoft OAuth sign-in. Tokens are encrypted

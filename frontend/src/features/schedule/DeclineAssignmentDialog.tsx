@@ -1,4 +1,12 @@
-import { UserX, Ban, CheckCircle2, AlertTriangle, Loader2 } from "lucide-react";
+import {
+  UserX,
+  Ban,
+  CheckCircle2,
+  AlertTriangle,
+  Loader2,
+  ArrowRightLeft,
+  CalendarOff,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -73,6 +81,36 @@ function CandidateRow({
             {candidate.previouslyDeclined && (
               <Badge variant="outline" className="font-normal">
                 <Ban className="size-3 mr-1" /> previously declined
+              </Badge>
+            )}
+            {candidate.overlappingAssignments.length > 0 && (
+              <Badge
+                variant="outline"
+                className="font-normal border-amber-400 text-amber-700"
+                title={candidate.overlappingAssignments
+                  .map((o) => `${o.eventTitle} (${formatRange(o.start, o.end)})`)
+                  .join("\n")}
+              >
+                <ArrowRightLeft className="size-3 mr-1" />
+                on "{candidate.overlappingAssignments[0].eventTitle}"
+                {candidate.overlappingAssignments.length > 1 && (
+                  <> +{candidate.overlappingAssignments.length - 1}</>
+                )}
+              </Badge>
+            )}
+            {candidate.availabilityConflicts.length > 0 && (
+              <Badge
+                variant="outline"
+                className="font-normal border-amber-400 text-amber-700"
+                title={candidate.availabilityConflicts
+                  .map((c) => `${c.type} (${formatRange(c.start, c.end)})`)
+                  .join("\n")}
+              >
+                <CalendarOff className="size-3 mr-1" />
+                {candidate.availabilityConflicts[0].type}
+                {candidate.availabilityConflicts.length > 1 && (
+                  <> +{candidate.availabilityConflicts.length - 1}</>
+                )}
               </Badge>
             )}
           </div>
