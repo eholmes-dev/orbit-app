@@ -8,6 +8,8 @@ import {
   Send,
   UserX,
   Loader2,
+  Wand2,
+  Ban,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -37,10 +39,13 @@ import {
   useConfirmSchedule,
 } from "@/features/schedule/useSchedule";
 import { DeclineAssignmentDialog } from "@/features/schedule/DeclineAssignmentDialog";
+import { CancelConflictDialog } from "@/features/schedule/CancelConflictDialog";
+import { ResolveConflictDialog } from "@/features/schedule/ResolveConflictDialog";
 import { useEvents } from "@/features/events/useEvents";
 import type {
   GenerateScheduleResult,
   ScheduleAssignment,
+  ScheduleConflict,
   ConflictReason,
   AssignmentStatus,
 } from "@/lib/types";
@@ -133,17 +138,25 @@ export function SchedulePage() {
   const generate = useGenerateSchedule();
   const confirmMut = useConfirmSchedule();
 
-  // Local source of truth for displayed assignments. Initially seeded from the
-  // generate result, then patched by confirm / decline so we don't have to
-  // re-run the solver after every mutation.
+  // Local source of truth for displayed assignments + conflicts. Seeded from
+  // the generate result, then patched by confirm / decline / resolve / cancel
+  // so we don't have to re-run the solver after every mutation.
   const [assignments, setAssignments] = useState<ScheduleAssignment[]>([]);
+  const [conflicts, setConflicts] = useState<ScheduleConflict[]>([]);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [decliningAssignment, setDecliningAssignment] =
     useState<ScheduleAssignment | null>(null);
+  const [cancellingConflict, setCancellingConflict] =
+    useState<ScheduleConflict | null>(null);
+  const [resolvingConflict, setResolvingConflict] =
+    useState<ScheduleConflict | null>(null);
 
   useEffect(() => {
     if (generate.data?.assignments) {
       setAssignments(generate.data.assignments);
+    }
+    if (generate.data?.conflicts) {
+      setConflicts(generate.data.conflicts);
     }
   }, [generate.data]);
 
@@ -188,6 +201,56 @@ export function SchedulePage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Confirm failed");
     }
+  };
+
+  // After Resolve dialog closes with at least one action taken, patch local
+  // assignments with the returned rows (covers source and target events for
+  // moves) and remove the conflict if the event is now sufficiently staffed.
+  const onResolveResolved = (updatedAssignments: ScheduleAssignment[]) => {
+    if (updatedAssignments.length === 0) return;
+    // Group updates by event id, replace local assignments for each.
+    const touchedEventIds = new Set(updatedAssignments.map((a) => a.event.id));
+    setAssignments((prev) => {
+      const others = prev.filter((a) => !touchedEventIds.has(a.event.id));
+      return [...others, ...updatedAssignments].sort(
+        (a, b) =>
+          new Date(a.event.startDateTime).getTime() -
+          new Date(b.event.startDateTime).getTime(),
+      );
+    });
+    // If we added enough new assignments to the resolved event to cover the
+    // shortfall, clear the conflict from the panel. Other events that were
+    // touched (e.g. the source of a move) might be newly under-staffed —
+    // those will surface on the next Generate.
+    if (resolvingConflict) {
+      const evId = resolvingConflict.event_id;
+      const newAssignedCount = updatedAssignments.filter(
+        (a) => a.event.id === evId,
+      ).length;
+      const previousAssignedCount = assignments.filter(
+        (a) => a.event.id === evId,
+      ).length;
+      if (
+        newAssignedCount - previousAssignedCount >= resolvingConflict.short_by
+      ) {
+        setConflicts((prev) => prev.filter((c) => c.event_id !== evId));
+      }
+    }
+  };
+
+  const onCancelConflictSuccess = (
+    eventId: string,
+    result: import("@/features/schedule/useSchedule").CancelConflictResult,
+  ) => {
+    if (result.action === "cancelled") {
+      // Full cancel: assignments are gone and event is marked cancelled.
+      setAssignments((prev) => prev.filter((a) => a.event.id !== eventId));
+    }
+    // For 'reduced': assignments stay as-is; only the event.requiredStaffCount
+    // changed in the DB. Local state doesn't need to track that, the conflict
+    // just goes away.
+    setConflicts((prev) => prev.filter((c) => c.event_id !== eventId));
+    setCancellingConflict(null);
   };
 
   // The decline modal owns its own mutation and returns the updated assignment
@@ -445,15 +508,15 @@ export function SchedulePage() {
                 <h2 className="text-lg font-medium flex items-center gap-2">
                   <AlertCircle className="size-4 text-destructive" /> Conflicts
                 </h2>
-                {result.conflicts.length === 0 ? (
+                {conflicts.length === 0 ? (
                   <p className="mt-2 text-sm text-muted-foreground flex items-center gap-2">
                     <CheckCircle2 className="size-4 text-green-600" /> No conflicts.
                   </p>
                 ) : (
                   <ul className="mt-2 space-y-2">
-                    {result.conflicts.map((c, i) => (
+                    {conflicts.map((c, i) => (
                       <li
-                        key={i}
+                        key={`${c.event_id}-${i}`}
                         className="border rounded-md p-3 bg-card text-sm"
                       >
                         <Link
@@ -470,6 +533,26 @@ export function SchedulePage() {
                         </div>
                         <div className="mt-1 text-muted-foreground text-xs">
                           {c.message}
+                        </div>
+                        <div className="mt-2 flex gap-1.5">
+                          <Button
+                            size="sm"
+                            variant="default"
+                            onClick={() => setResolvingConflict(c)}
+                            title="See why this conflict exists and rearrange people across events to fix it"
+                          >
+                            <Wand2 className="size-3.5" />
+                            Resolve
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => setCancellingConflict(c)}
+                            title="Accept partial coverage (reduces requirement) or cancel the event if nobody is assigned"
+                          >
+                            <Ban className="size-3.5" />
+                            Cancel & archive
+                          </Button>
                         </div>
                       </li>
                     ))}
@@ -536,6 +619,58 @@ export function SchedulePage() {
         assignment={decliningAssignment}
         onClose={() => setDecliningAssignment(null)}
         onResolved={onDeclineResolved}
+      />
+
+      <ResolveConflictDialog
+        conflict={resolvingConflict}
+        currentAssignments={
+          resolvingConflict
+            ? assignments.filter(
+                (a) => a.event.id === resolvingConflict.event_id,
+              )
+            : []
+        }
+        eventTitle={
+          resolvingConflict
+            ? eventTitleById.get(resolvingConflict.event_id)
+            : undefined
+        }
+        onClose={() => setResolvingConflict(null)}
+        onResolved={onResolveResolved}
+      />
+
+      <CancelConflictDialog
+        open={!!cancellingConflict}
+        input={
+          cancellingConflict
+            ? {
+                eventId: cancellingConflict.event_id,
+                conflictReason: cancellingConflict.reason,
+                conflictShortBy: cancellingConflict.short_by,
+              }
+            : null
+        }
+        eventTitle={
+          cancellingConflict
+            ? eventTitleById.get(cancellingConflict.event_id)
+            : undefined
+        }
+        currentAssignedCount={
+          cancellingConflict
+            ? assignments.filter(
+                (a) => a.event.id === cancellingConflict.event_id,
+              ).length
+            : 0
+        }
+        originalRequiredStaffCount={
+          cancellingConflict
+            ? assignments.filter(
+                (a) => a.event.id === cancellingConflict.event_id,
+              ).length + cancellingConflict.short_by
+            : 0
+        }
+        onClose={() => setCancellingConflict(null)}
+        onSuccess={onCancelConflictSuccess}
       />
     </div>
   );

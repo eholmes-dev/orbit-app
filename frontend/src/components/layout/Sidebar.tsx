@@ -6,6 +6,7 @@ import {
   Calendar,
   CalendarOff,
   Sparkles,
+  Archive,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { UserMenu } from "./UserMenu";
@@ -16,6 +17,7 @@ const navItems = [
   { to: "/labels", label: "Labels", icon: Tags },
   { to: "/events", label: "Events", icon: Calendar },
   { to: "/availability", label: "Availability", icon: CalendarOff },
+  { to: "/archive", label: "Archive", icon: Archive },
 ];
 
 export function Sidebar() {

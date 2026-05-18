@@ -25,6 +25,7 @@ model Person {
   availability     Availability[]
   assignments      Assignment[]
   blackoutDates    BlackoutDate[]
+  archiveEntries   ArchiveEntry[]
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 }
@@ -40,19 +41,22 @@ model Label {
 }
 
 model Event {
-  id                 String       @id @default(cuid())
+  id                 String         @id @default(cuid())
   title              String
   startDateTime      DateTime
   endDateTime        DateTime
   priorityTier       Int
-  requiredStaffCount Int          @default(1)
-  isHardRequirement  Boolean      @default(false)
+  requiredStaffCount Int            @default(1)
+  isHardRequirement  Boolean        @default(false)
   recurrenceRule     String?
   location           String?
-  requiredLabels     Label[]      @relation("EventLabels")
+  cancelledAt        DateTime?
+  cancellationReason String?
+  requiredLabels     Label[]        @relation("EventLabels")
   assignments        Assignment[]
-  createdAt          DateTime     @default(now())
-  updatedAt          DateTime     @updatedAt
+  archiveEntries     ArchiveEntry[]
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 }
 
 enum AvailabilityType {
@@ -113,6 +117,35 @@ model Assignment {
   updatedAt         DateTime         @updatedAt
 
   @@unique([eventId, personId])
+}
+
+enum ArchiveKind {
+  declined_assignment
+  accepted_conflict
+  cancelled_event
+  reduced_requirement
+}
+
+// Unified audit log of admin decisions: every decline, accepted conflict, and
+// cancelled event lands here. The Schedule UI consults this to surface the
+// archive page; nothing else depends on it for solver behavior (those use
+// AssignmentStatus.declined and Event.cancelledAt directly).
+model ArchiveEntry {
+  id                         String      @id @default(cuid())
+  kind                       ArchiveKind
+  eventId                    String
+  event                      Event       @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  personId                   String?
+  person                     Person?     @relation(fields: [personId], references: [id], onDelete: SetNull)
+  reason                     String?
+  conflictReason             String?
+  conflictShortBy            Int?
+  previousRequiredStaffCount Int?
+  newRequiredStaffCount      Int?
+  createdAt                  DateTime    @default(now())
+
+  @@index([createdAt(sort: Desc)])
+  @@index([eventId])
 }
 
 // Admin session — created after Microsoft OAuth sign-in. Tokens are encrypted

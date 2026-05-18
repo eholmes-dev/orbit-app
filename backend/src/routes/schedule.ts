@@ -84,9 +84,12 @@ scheduleRouter.post(
     const rangeStart = new Date(startDate);
     const rangeEnd = new Date(endDate);
 
-    // 1. Gather events that overlap the requested range.
+    // 1. Gather events that overlap the requested range. Cancelled events
+    // (Event.cancelledAt != null) are excluded — admin already decided not to
+    // staff them, so they shouldn't generate conflicts on regen.
     const events = await prisma.event.findMany({
       where: {
+        cancelledAt: null,
         startDateTime: { lt: rangeEnd },
         endDateTime: { gt: rangeStart },
       },
@@ -322,7 +325,7 @@ scheduleRouter.post(
       where: { id: req.params.id },
       include: {
         event: { select: { id: true } },
-        person: { select: { email: true } },
+        person: { select: { id: true, email: true } },
       },
     });
 
@@ -352,6 +355,14 @@ scheduleRouter.post(
           status: "declined",
           externalEventId: null,
           syncedToOutlookAt: null,
+        },
+      });
+      // Audit log entry — only on the actual flip, not on idempotent re-calls.
+      await prisma.archiveEntry.create({
+        data: {
+          kind: "declined_assignment",
+          eventId: a.event.id,
+          personId: a.person.id,
         },
       });
     }
@@ -403,12 +414,22 @@ scheduleRouter.get(
     const eventStart = event.startDateTime;
     const eventEnd = event.endDateTime;
 
-    // All active people, then narrow to those with every required label.
+    // People already (non-declined) assigned to THIS event. They aren't
+    // "other qualified people" — they're already on the roster.
+    const alreadyAssignedHere = await prisma.assignment.findMany({
+      where: { eventId: event.id, status: { not: "declined" } },
+      select: { personId: true },
+    });
+    const assignedHereSet = new Set(alreadyAssignedHere.map((a) => a.personId));
+
+    // All active people, then narrow to those with every required label AND
+    // not already on this event.
     const people = await prisma.person.findMany({
       where: { active: true },
       include: { labels: { select: { id: true } } },
     });
     const qualified = people.filter((p) => {
+      if (assignedHereSet.has(p.id)) return false;
       const owned = new Set(p.labels.map((l) => l.id));
       return requiredLabelIds.every((rid) => owned.has(rid));
     });
@@ -511,6 +532,7 @@ scheduleRouter.get(
           end: av.endDateTime,
         })),
         overlappingAssignments: overlaps.map((oa) => ({
+          fromAssignmentId: oa.id,
           eventTitle: oa.event.title,
           start: oa.event.startDateTime,
           end: oa.event.endDateTime,
@@ -534,5 +556,336 @@ scheduleRouter.get(
     });
 
     res.json({ candidates });
+  }),
+);
+
+const conflictRefSchema = z.object({
+  eventId: z.string().min(1),
+  conflictReason: z.string().min(1),
+  conflictShortBy: z.number().int().min(0),
+});
+
+scheduleRouter.post(
+  "/conflicts/accept",
+  asyncHandler(async (req, res) => {
+    const { eventId, conflictReason, conflictShortBy } = conflictRefSchema.parse(req.body);
+    // Verify the event exists (404 if not).
+    await prisma.event.findUniqueOrThrow({ where: { id: eventId } });
+
+    const entry = await prisma.archiveEntry.create({
+      data: {
+        kind: "accepted_conflict",
+        eventId,
+        conflictReason,
+        conflictShortBy,
+      },
+    });
+    res.status(201).json({ archiveEntryId: entry.id });
+  }),
+);
+
+const cancelSchema = conflictRefSchema.extend({
+  reason: z.string().trim().min(1, "Reason is required").max(1000),
+});
+
+scheduleRouter.post(
+  "/conflicts/cancel",
+  asyncHandler(async (req, res) => {
+    const { eventId, conflictReason, conflictShortBy, reason } =
+      cancelSchema.parse(req.body);
+
+    const event = await prisma.event.findUniqueOrThrow({
+      where: { id: eventId },
+    });
+    if (event.cancelledAt) {
+      throw new HttpError(409, "Event is already cancelled");
+    }
+
+    const activeAssignments = await prisma.assignment.findMany({
+      where: { eventId, status: { not: "declined" } },
+      include: { person: { select: { email: true } } },
+    });
+    const assignedCount = activeAssignments.length;
+
+    // Partial coverage path: at least one person is on the event but not
+    // enough. Reduce the requirement to match actual coverage — the event
+    // stays, assignments stay, no Outlook cleanup needed.
+    if (assignedCount > 0) {
+      const previousRequired = event.requiredStaffCount;
+      await prisma.$transaction([
+        prisma.event.update({
+          where: { id: eventId },
+          data: { requiredStaffCount: assignedCount },
+        }),
+        prisma.archiveEntry.create({
+          data: {
+            kind: "reduced_requirement",
+            eventId,
+            reason,
+            conflictReason,
+            conflictShortBy,
+            previousRequiredStaffCount: previousRequired,
+            newRequiredStaffCount: assignedCount,
+          },
+        }),
+      ]);
+
+      res.json({
+        action: "reduced",
+        previousRequiredStaffCount: previousRequired,
+        newRequiredStaffCount: assignedCount,
+      });
+      return;
+    }
+
+    // Full cancel path: nobody assigned at all. Mark event cancelled. (No
+    // assignments to clean up, no Outlook events to delete in this branch.)
+    await prisma.$transaction([
+      prisma.event.update({
+        where: { id: eventId },
+        data: { cancelledAt: new Date(), cancellationReason: reason },
+      }),
+      prisma.archiveEntry.create({
+        data: {
+          kind: "cancelled_event",
+          eventId,
+          reason,
+          conflictReason,
+          conflictShortBy,
+        },
+      }),
+    ]);
+
+    res.json({
+      action: "cancelled",
+      cancelledEventId: eventId,
+    });
+  }),
+);
+
+const assignSchema = z.object({ personId: z.string().min(1) });
+
+scheduleRouter.post(
+  "/events/:eventId/assign",
+  asyncHandler(async (req, res) => {
+    const { personId } = assignSchema.parse(req.body);
+    const eventId = req.params.eventId;
+
+    const [event, person, existing] = await Promise.all([
+      prisma.event.findUniqueOrThrow({
+        where: { id: eventId },
+        include: { requiredLabels: { select: { id: true } } },
+      }),
+      prisma.person.findUniqueOrThrow({
+        where: { id: personId },
+        include: { labels: { select: { id: true } } },
+      }),
+      prisma.assignment.findUnique({
+        where: { eventId_personId: { eventId, personId } },
+      }),
+    ]);
+
+    if (event.cancelledAt) {
+      throw new HttpError(409, "Event is cancelled");
+    }
+    const personLabels = new Set(person.labels.map((l) => l.id));
+    const missing = event.requiredLabels.filter(
+      (l) => !personLabels.has(l.id),
+    );
+    if (missing.length > 0) {
+      throw new HttpError(
+        409,
+        `${person.name} is missing required label(s) for this event.`,
+      );
+    }
+
+    if (existing) {
+      if (existing.status === "declined") {
+        // Un-decline → propose. The original decline is reversed by admin intent.
+        await prisma.assignment.update({
+          where: { id: existing.id },
+          data: {
+            status: "proposed",
+            externalEventId: null,
+            syncedToOutlookAt: null,
+          },
+        });
+      } else {
+        throw new HttpError(
+          409,
+          `${person.name} is already assigned to this event.`,
+        );
+      }
+    } else {
+      await prisma.assignment.create({
+        data: { eventId, personId, status: "proposed" },
+      });
+    }
+
+    const updated = await prisma.assignment.findMany({
+      where: { eventId, status: { not: "declined" } },
+      include: assignmentIncludeForResponse,
+      orderBy: { event: { startDateTime: "asc" } },
+    });
+    res.json({ updatedAssignments: updated });
+  }),
+);
+
+const moveSchema = z.object({ toEventId: z.string().min(1) });
+
+scheduleRouter.post(
+  "/assignments/:id/move",
+  asyncHandler(async (req, res) => {
+    const { toEventId } = moveSchema.parse(req.body);
+    const fromAssignmentId = req.params.id;
+
+    const fromAssignment = await prisma.assignment.findUniqueOrThrow({
+      where: { id: fromAssignmentId },
+      include: { person: { select: { id: true, email: true, name: true } } },
+    });
+    if (fromAssignment.status === "declined") {
+      throw new HttpError(409, "Source assignment is already declined");
+    }
+    if (fromAssignment.eventId === toEventId) {
+      throw new HttpError(400, "Source and target events are the same");
+    }
+
+    const [toEvent, existingOnTarget] = await Promise.all([
+      prisma.event.findUniqueOrThrow({
+        where: { id: toEventId },
+        include: { requiredLabels: { select: { id: true } } },
+      }),
+      prisma.assignment.findUnique({
+        where: {
+          eventId_personId: {
+            eventId: toEventId,
+            personId: fromAssignment.person.id,
+          },
+        },
+      }),
+    ]);
+
+    if (toEvent.cancelledAt) {
+      throw new HttpError(409, "Target event is cancelled");
+    }
+
+    // Verify the person qualifies for the target.
+    const person = await prisma.person.findUniqueOrThrow({
+      where: { id: fromAssignment.person.id },
+      include: { labels: { select: { id: true } } },
+    });
+    const personLabels = new Set(person.labels.map((l) => l.id));
+    const missing = toEvent.requiredLabels.filter(
+      (l) => !personLabels.has(l.id),
+    );
+    if (missing.length > 0) {
+      throw new HttpError(
+        409,
+        `${person.name} is missing required label(s) for the target event.`,
+      );
+    }
+
+    if (
+      existingOnTarget &&
+      existingOnTarget.status !== "declined"
+    ) {
+      throw new HttpError(
+        409,
+        `${person.name} is already assigned to the target event.`,
+      );
+    }
+
+    // Clean up source Outlook event if it was confirmed.
+    if (
+      fromAssignment.status === "confirmed" &&
+      fromAssignment.externalEventId
+    ) {
+      try {
+        await deleteCalendarEvent(
+          fromAssignment.person.email,
+          fromAssignment.externalEventId,
+        );
+      } catch (err) {
+        throw new HttpError(
+          502,
+          `Failed to remove source Outlook event: ${err instanceof Error ? err.message : err}. Move aborted.`,
+        );
+      }
+    }
+
+    const fromEventId = fromAssignment.eventId;
+
+    await prisma.$transaction(async (tx) => {
+      // Decline the source assignment.
+      await tx.assignment.update({
+        where: { id: fromAssignment.id },
+        data: {
+          status: "declined",
+          externalEventId: null,
+          syncedToOutlookAt: null,
+        },
+      });
+      await tx.archiveEntry.create({
+        data: {
+          kind: "declined_assignment",
+          eventId: fromEventId,
+          personId: fromAssignment.person.id,
+          reason: `Moved to event ${toEventId}`,
+        },
+      });
+      // Create or un-decline on the target.
+      if (existingOnTarget && existingOnTarget.status === "declined") {
+        await tx.assignment.update({
+          where: { id: existingOnTarget.id },
+          data: {
+            status: "proposed",
+            externalEventId: null,
+            syncedToOutlookAt: null,
+          },
+        });
+      } else {
+        await tx.assignment.create({
+          data: {
+            eventId: toEventId,
+            personId: fromAssignment.person.id,
+            status: "proposed",
+          },
+        });
+      }
+    });
+
+    const updated = await prisma.assignment.findMany({
+      where: {
+        eventId: { in: [fromEventId, toEventId] },
+        status: { not: "declined" },
+      },
+      include: assignmentIncludeForResponse,
+      orderBy: { event: { startDateTime: "asc" } },
+    });
+    res.json({ updatedAssignments: updated, fromEventId, toEventId });
+  }),
+);
+
+scheduleRouter.get(
+  "/archive",
+  asyncHandler(async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 200, 500);
+    const entries = await prisma.archiveEntry.findMany({
+      orderBy: { createdAt: "desc" },
+      take: limit,
+      include: {
+        event: {
+          select: {
+            id: true,
+            title: true,
+            startDateTime: true,
+            endDateTime: true,
+            cancelledAt: true,
+          },
+        },
+        person: { select: { id: true, name: true, email: true } },
+      },
+    });
+    res.json(entries);
   }),
 );
