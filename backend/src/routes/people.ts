@@ -7,6 +7,11 @@ export const peopleRouter = Router();
 
 const personInclude = {
   labels: { select: { id: true, name: true } },
+  // Counts used by the People page to decide whether a person can be hard-
+  // deleted (zero history) vs. only deactivated (some history to preserve).
+  _count: {
+    select: { assignments: true, availability: true },
+  },
 } as const;
 
 function buildLabelMutation(labelIds: string[] | undefined, mode: "set" | "create") {

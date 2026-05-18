@@ -198,6 +198,14 @@ scheduleRouter.post(
       orderBy: { event: { startDateTime: "asc" } },
     });
 
+    // Hydrate warnings with the person's name so the UI can show "Jane Doe"
+    // instead of a raw cuid. We already have `people` in scope from step 2.
+    const personNameById = new Map(people.map((p) => [p.id, p.name]));
+    const hydratedWarnings = solverResult.warnings.map((w) => ({
+      ...w,
+      person_name: personNameById.get(w.person_id) ?? w.person_id,
+    }));
+
     res.json({
       status: solverResult.status,
       solveTimeMs: solverResult.solve_time_ms,
@@ -210,7 +218,7 @@ scheduleRouter.post(
       },
       assignments: hydrated,
       conflicts: solverResult.conflicts,
-      warnings: solverResult.warnings,
+      warnings: hydratedWarnings,
     });
   }),
 );
@@ -1184,5 +1192,163 @@ scheduleRouter.get(
       },
     });
     res.json(entries);
+  }),
+);
+
+const workloadSchema = z
+  .object({
+    from: z.string().datetime({ offset: true }).or(z.string().datetime()),
+    to: z.string().datetime({ offset: true }).or(z.string().datetime()),
+  })
+  .refine((v) => new Date(v.to).getTime() > new Date(v.from).getTime(), {
+    message: "to must be after from",
+    path: ["to"],
+  });
+
+// Returns "YYYY-MM-DD" of the Monday of the ISO week containing d (UTC).
+// Used to bucket per-week hours for peak-utilization calc.
+function isoMondayKey(d: Date): string {
+  const utcDay = d.getUTCDay();
+  const mondayOffset = utcDay === 0 ? -6 : 1 - utcDay;
+  const monday = new Date(d);
+  monday.setUTCDate(monday.getUTCDate() + mondayOffset);
+  monday.setUTCHours(0, 0, 0, 0);
+  return monday.toISOString().slice(0, 10);
+}
+
+scheduleRouter.get(
+  "/workload",
+  asyncHandler(async (req, res) => {
+    const { from, to } = workloadSchema.parse(req.query);
+    const rangeStart = new Date(from);
+    const rangeEnd = new Date(to);
+    const rangeMs = rangeEnd.getTime() - rangeStart.getTime();
+    const weeksInRange = rangeMs / (7 * 24 * 60 * 60 * 1000);
+
+    // All active people — including ones with zero assignments so admin can
+    // see who's under-utilized too.
+    const people = await prisma.person.findMany({
+      where: { active: true },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        department: true,
+        maxHoursPerWeek: true,
+      },
+      orderBy: { name: "asc" },
+    });
+
+    // Proposed + confirmed assignments overlapping the range (declined excluded).
+    const assignments = await prisma.assignment.findMany({
+      where: {
+        status: { in: ["proposed", "confirmed"] },
+        event: {
+          startDateTime: { lt: rangeEnd },
+          endDateTime: { gt: rangeStart },
+        },
+      },
+      include: {
+        event: {
+          select: { startDateTime: true, endDateTime: true },
+        },
+      },
+    });
+
+    // For each person, sum hours per calendar week so we can compute the PEAK
+    // week's utilization (the right thing to compare against a "max h/week"
+    // cap — taking total/range_weeks projects the rate and explodes for
+    // short ranges).
+    const totalsByPerson = new Map<string, number>();
+    const countByPerson = new Map<string, number>();
+    const weeklyByPerson = new Map<string, Map<string, number>>();
+    for (const a of assignments) {
+      const hours =
+        (a.event.endDateTime.getTime() - a.event.startDateTime.getTime()) /
+        3600000;
+      totalsByPerson.set(
+        a.personId,
+        (totalsByPerson.get(a.personId) ?? 0) + hours,
+      );
+      countByPerson.set(
+        a.personId,
+        (countByPerson.get(a.personId) ?? 0) + 1,
+      );
+      // Bucket by the ISO Monday of the event's START. Shifts that cross
+      // a week boundary count entirely in the week they started — good
+      // enough for the typical single-day shift; revisit if cross-week
+      // shifts become common.
+      const weekKey = isoMondayKey(a.event.startDateTime);
+      let personWeeks = weeklyByPerson.get(a.personId);
+      if (!personWeeks) {
+        personWeeks = new Map();
+        weeklyByPerson.set(a.personId, personWeeks);
+      }
+      personWeeks.set(weekKey, (personWeeks.get(weekKey) ?? 0) + hours);
+    }
+
+    const rows = people.map((p) => {
+      const hoursAssigned = totalsByPerson.get(p.id) ?? 0;
+      const personWeeks = weeklyByPerson.get(p.id);
+      const peakWeeklyHours = personWeeks
+        ? Math.max(...personWeeks.values())
+        : 0;
+      const avgPerWeek = weeksInRange > 0 ? hoursAssigned / weeksInRange : 0;
+      // Util is now PEAK week / cap — "in your worst single calendar week,
+      // what fraction of your cap did you use?"
+      const utilization =
+        p.maxHoursPerWeek && p.maxHoursPerWeek > 0
+          ? Math.round((peakWeeklyHours / p.maxHoursPerWeek) * 100)
+          : null;
+      return {
+        person: {
+          id: p.id,
+          name: p.name,
+          email: p.email,
+          department: p.department,
+        },
+        maxHoursPerWeek: p.maxHoursPerWeek,
+        hoursAssigned: Math.round(hoursAssigned * 10) / 10,
+        avgHoursPerWeek: Math.round(avgPerWeek * 10) / 10,
+        peakWeeklyHours: Math.round(peakWeeklyHours * 10) / 10,
+        utilization,
+        assignmentCount: countByPerson.get(p.id) ?? 0,
+      };
+    });
+
+    const allHours = rows.map((r) => r.hoursAssigned);
+    const peopleWithAnyHours = allHours.filter((h) => h > 0).length;
+    const totalHours = allHours.reduce((s, h) => s + h, 0);
+    const max = allHours.length ? Math.max(...allHours) : 0;
+    const min = allHours.length ? Math.min(...allHours) : 0;
+    const peopleAtCap = rows.filter(
+      (r) => r.utilization != null && r.utilization >= 100,
+    ).length;
+
+    res.json({
+      range: {
+        from: rangeStart,
+        to: rangeEnd,
+        weeks: Math.round(weeksInRange * 100) / 100,
+      },
+      summary: {
+        totalHours: Math.round(totalHours * 10) / 10,
+        averagePerPerson:
+          people.length > 0
+            ? Math.round((totalHours / people.length) * 10) / 10
+            : 0,
+        averagePerActivePerson:
+          peopleWithAnyHours > 0
+            ? Math.round((totalHours / peopleWithAnyHours) * 10) / 10
+            : 0,
+        minHours: Math.round(min * 10) / 10,
+        maxHours: Math.round(max * 10) / 10,
+        spreadHours: Math.round((max - min) * 10) / 10,
+        peopleTotal: people.length,
+        peopleWithAnyHours,
+        peopleAtCap,
+      },
+      rows,
+    });
   }),
 );

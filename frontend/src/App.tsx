@@ -7,6 +7,7 @@ import { EventsPage } from "@/pages/EventsPage";
 import { AvailabilityPage } from "@/pages/AvailabilityPage";
 import { SchedulePage } from "@/pages/SchedulePage";
 import { ArchivePage } from "@/pages/ArchivePage";
+import { WorkloadPage } from "@/pages/WorkloadPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { useAuth } from "@/features/auth/useAuth";
 
@@ -40,6 +41,7 @@ export default function App() {
             <Route path="/labels" element={<LabelsPage />} />
             <Route path="/events" element={<EventsPage />} />
             <Route path="/availability" element={<AvailabilityPage />} />
+            <Route path="/workload" element={<WorkloadPage />} />
             <Route path="/archive" element={<ArchivePage />} />
           </Route>
         </Route>

@@ -5,18 +5,20 @@ import {
   CalendarDays,
   Calendar,
   CalendarOff,
-  Sparkles,
+  CalendarCheck,
   Archive,
+  BarChart3,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { UserMenu } from "./UserMenu";
 
 const navItems = [
-  { to: "/schedule", label: "Schedule", icon: Sparkles },
+  { to: "/schedule", label: "Schedule", icon: CalendarCheck },
   { to: "/people", label: "People", icon: Users },
   { to: "/labels", label: "Labels", icon: Tags },
   { to: "/events", label: "Events", icon: Calendar },
   { to: "/availability", label: "Availability", icon: CalendarOff },
+  { to: "/workload", label: "Workload", icon: BarChart3 },
   { to: "/archive", label: "Archive", icon: Archive },
 ];
 

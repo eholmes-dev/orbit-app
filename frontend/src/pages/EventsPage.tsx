@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Pencil, Trash2, Plus } from "lucide-react";
+import { Pencil, Trash2, Plus, Calendar } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -142,7 +142,9 @@ export function EventsPage() {
     <div className="p-8 max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Events</h1>
+          <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
+            <Calendar className="size-6" /> Events
+          </h1>
           <p className="text-sm text-muted-foreground">
             Shifts and staffing needs the scheduler will fill.
           </p>

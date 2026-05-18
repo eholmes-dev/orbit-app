@@ -23,6 +23,11 @@ interface DateTimeInputProps {
   disabled?: boolean;
 }
 
+// Year-dropdown bounds for the date picker's caption dropdowns. Computed
+// once at module load.
+const PICKER_START_MONTH = new Date(new Date().getFullYear() - 5, 0);
+const PICKER_END_MONTH = new Date(new Date().getFullYear() + 10, 11);
+
 /** 15-minute time slots, "HH:mm" + locale-formatted label. Generated once. */
 const TIME_OPTIONS: { value: string; label: string }[] = (() => {
   const opts: { value: string; label: string }[] = [];
@@ -101,7 +106,15 @@ export function DateTimeInput({ value, onChange, disabled }: DateTimeInputProps)
           </Button>
         </PopoverTrigger>
         <PopoverContent className="w-auto p-0" align="start">
-          <Calendar mode="single" selected={date} onSelect={setDate} autoFocus />
+          <Calendar
+            mode="single"
+            selected={date}
+            onSelect={setDate}
+            captionLayout="dropdown"
+            startMonth={PICKER_START_MONTH}
+            endMonth={PICKER_END_MONTH}
+            autoFocus
+          />
         </PopoverContent>
       </Popover>
       <Select

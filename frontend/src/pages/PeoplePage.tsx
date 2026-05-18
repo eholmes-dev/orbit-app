@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { Pencil, Trash2, Plus, CalendarOff } from "lucide-react";
+import {
+  Pencil,
+  Plus,
+  CalendarOff,
+  Users,
+  UserMinus,
+  UserCheck,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,6 +37,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import { Label as UiLabel } from "@/components/ui/label";
 import {
   usePeople,
   useCreatePerson,
@@ -65,7 +74,11 @@ export function PeoplePage() {
 
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<Person | null>(null);
-  const [deleting, setDeleting] = useState<Person | null>(null);
+  // `removing` drives a single confirmation dialog used for BOTH deactivation
+  // and (if the person has no history) permanent deletion. The dialog inspects
+  // the person's _count to decide which actions are offered.
+  const [removing, setRemoving] = useState<Person | null>(null);
+  const [showInactive, setShowInactive] = useState(false);
 
   // Open the edit dialog automatically when navigated to with ?edit=<id> (e.g.,
   // from the Schedule page's person-name links).
@@ -106,22 +119,61 @@ export function PeoplePage() {
     }
   };
 
-  const handleDelete = async () => {
-    if (!deleting) return;
+  const handleDeactivate = async () => {
+    if (!removing) return;
     try {
-      await deleteMutation.mutateAsync(deleting.id);
-      toast.success(`Removed ${deleting.name}`);
-      setDeleting(null);
+      await updateMutation.mutateAsync({
+        id: removing.id,
+        input: { active: false },
+      });
+      toast.success(`Deactivated ${removing.name}`, {
+        description: "Past schedules preserved. Hidden from future scheduling.",
+      });
+      setRemoving(null);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to deactivate");
+    }
+  };
+
+  const handleActivate = async (person: Person) => {
+    try {
+      await updateMutation.mutateAsync({
+        id: person.id,
+        input: { active: true },
+      });
+      toast.success(`Reactivated ${person.name}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to reactivate");
+    }
+  };
+
+  const handleHardDelete = async () => {
+    if (!removing) return;
+    try {
+      await deleteMutation.mutateAsync(removing.id);
+      toast.success(`Permanently deleted ${removing.name}`);
+      setRemoving(null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to delete");
     }
   };
 
+  // Filter visible people. Inactive hidden by default; toggle reveals them.
+  const visiblePeople = people?.filter((p) => showInactive || p.active) ?? [];
+  const inactiveCount = people?.filter((p) => !p.active).length ?? 0;
+  // Hybrid policy: hard-delete only allowed when the person has zero history.
+  const hasHistory =
+    removing &&
+    ((removing._count?.assignments ?? 0) > 0 ||
+      (removing._count?.availability ?? 0) > 0);
+
   return (
     <div className="p-8 max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">People</h1>
+          <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
+            <Users className="size-6" /> People
+          </h1>
           <p className="text-sm text-muted-foreground">
             Doctors and faculty available for scheduling.
           </p>
@@ -155,6 +207,20 @@ export function PeoplePage() {
         </p>
       )}
 
+      {people && inactiveCount > 0 && (
+        <div className="flex items-center gap-2 mb-3">
+          <Switch
+            id="show-inactive"
+            checked={showInactive}
+            onCheckedChange={setShowInactive}
+          />
+          <UiLabel htmlFor="show-inactive" className="text-sm font-normal">
+            Include {inactiveCount} inactive{" "}
+            {inactiveCount === 1 ? "person" : "people"}
+          </UiLabel>
+        </div>
+      )}
+
       {people && (
         <div className="border rounded-lg bg-card">
           <Table>
@@ -169,18 +235,23 @@ export function PeoplePage() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {people.length === 0 && (
+              {visiblePeople.length === 0 && (
                 <TableRow>
                   <TableCell
                     colSpan={6}
                     className="text-center text-muted-foreground py-8"
                   >
-                    No people yet. Click "Add person" to create your first one.
+                    {people.length === 0
+                      ? `No people yet. Click "Add person" to create your first one.`
+                      : "No active people. Toggle 'Include inactive' to show others."}
                   </TableCell>
                 </TableRow>
               )}
-              {people.map((person) => (
-                <TableRow key={person.id}>
+              {visiblePeople.map((person) => (
+                <TableRow
+                  key={person.id}
+                  className={person.active ? "" : "opacity-60"}
+                >
                   <TableCell className="font-medium">{person.name}</TableCell>
                   <TableCell className="text-muted-foreground">
                     {person.email}
@@ -219,17 +290,32 @@ export function PeoplePage() {
                       variant="ghost"
                       onClick={() => setEditing(person)}
                       title="Edit"
+                      aria-label={`Edit ${person.name}`}
                     >
                       <Pencil className="size-4" />
                     </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      onClick={() => setDeleting(person)}
-                      title="Delete"
-                    >
-                      <Trash2 className="size-4" />
-                    </Button>
+                    {person.active ? (
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => setRemoving(person)}
+                        title="Deactivate (or permanently delete if no history)"
+                        aria-label={`Deactivate ${person.name}`}
+                      >
+                        <UserMinus className="size-4" />
+                      </Button>
+                    ) : (
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => handleActivate(person)}
+                        title="Reactivate"
+                        aria-label={`Reactivate ${person.name}`}
+                        disabled={updateMutation.isPending}
+                      >
+                        <UserCheck className="size-4" />
+                      </Button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -263,25 +349,66 @@ export function PeoplePage() {
       </Dialog>
 
       <AlertDialog
-        open={!!deleting}
-        onOpenChange={(open) => !open && setDeleting(null)}
+        open={!!removing}
+        onOpenChange={(open) => !open && setRemoving(null)}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove {deleting?.name}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will remove the person and all their availability records and
-              assignments. This cannot be undone.
+            <AlertDialogTitle>Remove {removing?.name}?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                {hasHistory ? (
+                  <>
+                    <p>
+                      {removing?.name} has{" "}
+                      <strong>
+                        {removing?._count?.assignments ?? 0} assignment
+                        {removing?._count?.assignments === 1 ? "" : "s"}
+                      </strong>{" "}
+                      and{" "}
+                      <strong>
+                        {removing?._count?.availability ?? 0} availability
+                        {removing?._count?.availability === 1 ? " entry" : " entries"}
+                      </strong>{" "}
+                      on record.
+                    </p>
+                    <p>
+                      Deactivating preserves that history (past schedules still
+                      show them) but hides them from future scheduling and
+                      pickers. You can reactivate later.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p>
+                      {removing?.name} has no assignments or availability on
+                      record yet. You can deactivate them (reversible) or
+                      permanently delete them.
+                    </p>
+                  </>
+                )}
+              </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <AlertDialogFooter>
+          <AlertDialogFooter className="sm:justify-between">
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
-              disabled={deleteMutation.isPending}
-            >
-              Delete
-            </AlertDialogAction>
+            <div className="flex gap-2">
+              {!hasHistory && (
+                <Button
+                  variant="destructive"
+                  onClick={handleHardDelete}
+                  disabled={deleteMutation.isPending || updateMutation.isPending}
+                >
+                  Permanently delete
+                </Button>
+              )}
+              <AlertDialogAction
+                onClick={handleDeactivate}
+                disabled={updateMutation.isPending}
+              >
+                Deactivate
+              </AlertDialogAction>
+            </div>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

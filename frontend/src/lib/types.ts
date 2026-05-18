@@ -17,6 +17,7 @@ export interface Person {
   preferredHours: number | null;
   outlookAccountId: string | null;
   labels: { id: string; name: string }[];
+  _count?: { assignments: number; availability: number };
   createdAt: string;
   updatedAt: string;
 }
@@ -129,6 +130,7 @@ export interface ScheduleConflict {
 
 export interface ScheduleWarning {
   person_id: string;
+  person_name: string;
   type: "excess_hours" | "uneven_workload";
   value: number;
   message: string;

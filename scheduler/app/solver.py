@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from ortools.sat.python import cp_model
 
@@ -55,6 +55,15 @@ def _person_qualified(person: PersonInput, event: EventInput) -> bool:
 
 def _event_duration_minutes(ev: EventInput) -> int:
     return max(0, int((ev.end - ev.start).total_seconds() // 60))
+
+
+def _iso_monday(dt: datetime) -> date:
+    """Monday of the ISO calendar week the datetime falls in.
+    Used to bucket assignments per week for cap-checking. We classify events
+    by their start time — healthcare shifts rarely cross midnight Sunday→Monday,
+    so we don't bother splitting duration across week boundaries.
+    """
+    return (dt - timedelta(days=dt.weekday())).date()
 
 
 def _categorize_conflict(
@@ -247,23 +256,39 @@ def solve(request: SolveRequest) -> SolveResponse:
                     )
                 )
 
+        # excess_hours warning: bucket each person's assigned minutes per ISO
+        # calendar week and only warn when the *peak* week exceeds the cap.
+        # The cap is per-week, so comparing total-across-the-window against
+        # it is wrong (caused false positives on multi-week ranges).
         for pi, person in enumerate(people):
-            if pi not in hours_var_by_person:
+            if person.max_hours_per_week is None:
                 continue
-            total_minutes = solver.Value(hours_var_by_person[pi])
-            total_hours = total_minutes / 60.0
-            if (
-                person.max_hours_per_week is not None
-                and total_hours > person.max_hours_per_week
-            ):
+            minutes_per_week: dict[date, int] = defaultdict(int)
+            for ei, event in enumerate(events):
+                if (ei, pi) not in x:
+                    continue
+                if solver.Value(x[(ei, pi)]) != 1:
+                    continue
+                week_key = _iso_monday(event.start)
+                minutes_per_week[week_key] += _event_duration_minutes(event)
+            if not minutes_per_week:
+                continue
+            peak_week, peak_minutes = max(
+                minutes_per_week.items(), key=lambda kv: kv[1]
+            )
+            peak_hours = peak_minutes / 60.0
+            if peak_hours > person.max_hours_per_week:
+                # %-d / %#d aren't portable across platforms; format day by hand.
+                month_day = f"{peak_week.strftime('%b')} {peak_week.day}"
                 warnings.append(
                     WarningResult(
                         person_id=person.id,
                         type="excess_hours",
-                        value=total_hours,
+                        value=peak_hours,
                         message=(
-                            f"Assigned {total_hours:.1f}h exceeds max "
-                            f"{person.max_hours_per_week}h."
+                            f"{peak_hours:.1f}h scheduled the week of "
+                            f"{month_day} — exceeds "
+                            f"{person.max_hours_per_week}h/wk cap."
                         ),
                     )
                 )

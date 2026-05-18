@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Pencil, Trash2, Plus } from "lucide-react";
+import { Pencil, Trash2, Plus, Tags } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -84,7 +84,9 @@ export function LabelsPage() {
     <div className="p-8 max-w-5xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Labels</h1>
+          <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
+            <Tags className="size-6" /> Labels
+          </h1>
           <p className="text-sm text-muted-foreground">
             Tags used to qualify staff for specific events (e.g. Surgery, ER, On-call).
           </p>
@@ -156,6 +158,8 @@ export function LabelsPage() {
                       size="icon"
                       variant="ghost"
                       onClick={() => setEditing(label)}
+                      title="Edit"
+                      aria-label={`Edit ${label.name}`}
                     >
                       <Pencil className="size-4" />
                     </Button>
@@ -163,6 +167,8 @@ export function LabelsPage() {
                       size="icon"
                       variant="ghost"
                       onClick={() => setDeleting(label)}
+                      title="Delete"
+                      aria-label={`Delete ${label.name}`}
                     >
                       <Trash2 className="size-4" />
                     </Button>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import {
   Play,
@@ -11,6 +11,10 @@ import {
   Wand2,
   Ban,
   CloudOff,
+  Table as TableIcon,
+  CalendarRange,
+  CalendarCheck,
+  ChevronRight,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -43,9 +47,14 @@ import {
 import { DeclineAssignmentDialog } from "@/features/schedule/DeclineAssignmentDialog";
 import { CancelConflictDialog } from "@/features/schedule/CancelConflictDialog";
 import { ResolveConflictDialog } from "@/features/schedule/ResolveConflictDialog";
+import { ScheduleCalendar } from "@/features/schedule/ScheduleCalendar";
+import {
+  useScheduleView,
+  useScheduleViewActions,
+} from "@/features/schedule/useScheduleView";
 import { useEvents } from "@/features/events/useEvents";
+import { SummaryCard } from "@/components/SummaryCard";
 import type {
-  GenerateScheduleResult,
   ScheduleAssignment,
   ScheduleConflict,
   ConflictReason,
@@ -134,18 +143,28 @@ function statusBadge(status: AssignmentStatus) {
 }
 
 export function SchedulePage() {
-  const [startDate, setStartDate] = useState(todayLocal());
-  const [endDate, setEndDate] = useState(plusDaysLocal(30));
+  const view = useScheduleView();
+  const { setView, patchAssignments, patchConflicts } =
+    useScheduleViewActions();
+  const cached = view.data;
+  // The schedule view lives in the TanStack Query cache so it survives
+  // navigation. Date inputs seed from the cached range on mount, then are
+  // independent local state (typing in them doesn't refetch / clobber the
+  // displayed schedule).
+  const [startDate, setStartDate] = useState(
+    () => cached?.range.startDate ?? todayLocal(),
+  );
+  const [endDate, setEndDate] = useState(
+    () => cached?.range.endDate ?? plusDaysLocal(30),
+  );
   const { data: events } = useEvents();
   const generate = useGenerateSchedule();
   const confirmMut = useConfirmSchedule();
   const unconfirmMut = useUnconfirmAssignments();
 
-  // Local source of truth for displayed assignments + conflicts. Seeded from
-  // the generate result, then patched by confirm / decline / resolve / cancel
-  // so we don't have to re-run the solver after every mutation.
-  const [assignments, setAssignments] = useState<ScheduleAssignment[]>([]);
-  const [conflicts, setConflicts] = useState<ScheduleConflict[]>([]);
+  const assignments = cached?.assignments ?? [];
+  const conflicts = cached?.conflicts ?? [];
+
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [decliningAssignment, setDecliningAssignment] =
     useState<ScheduleAssignment | null>(null);
@@ -155,17 +174,16 @@ export function SchedulePage() {
     useState<ScheduleConflict | null>(null);
   const [unsyncingAssignment, setUnsyncingAssignment] =
     useState<ScheduleAssignment | null>(null);
+  const [assignmentsView, setAssignmentsView] = useState<"table" | "calendar">(
+    "table",
+  );
+  // Per-section collapse for Conflicts and Warnings. A collapsed section
+  // shrinks to a small icon chicklet pinned to the right edge so the
+  // Assignments / Calendar view dynamically reclaims the freed width.
+  const [conflictsCollapsed, setConflictsCollapsed] = useState(false);
+  const [warningsCollapsed, setWarningsCollapsed] = useState(false);
 
-  useEffect(() => {
-    if (generate.data?.assignments) {
-      setAssignments(generate.data.assignments);
-    }
-    if (generate.data?.conflicts) {
-      setConflicts(generate.data.conflicts);
-    }
-  }, [generate.data]);
-
-  const result: GenerateScheduleResult | undefined = generate.data;
+  const result = cached;
   const grouped = useMemo(() => groupByDay(assignments), [assignments]);
   const proposedCount = useMemo(
     () => assignments.filter((a) => a.status === "proposed").length,
@@ -182,7 +200,17 @@ export function SchedulePage() {
     try {
       const startISO = new Date(startDate).toISOString();
       const endISO = new Date(endDate).toISOString();
-      await generate.mutateAsync({ startDate: startISO, endDate: endISO });
+      const res = await generate.mutateAsync({
+        startDate: startISO,
+        endDate: endISO,
+      });
+      // Replace the cached view. This is the only place a new view is seeded —
+      // everything else patches in place.
+      setView({
+        ...res,
+        range: { startDate, endDate },
+        generatedAt: new Date().toISOString(),
+      });
       toast.success("Schedule generated");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to generate schedule");
@@ -200,7 +228,7 @@ export function SchedulePage() {
     try {
       const res = await unconfirmMut.mutateAsync({ assignmentIds });
       const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
-      setAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
+      patchAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
       if (res.failed > 0) {
         toast.warning(
           `${res.unconfirmed} unsynced, ${res.failed} failed. Outlook may be partially out of sync.`,
@@ -216,9 +244,9 @@ export function SchedulePage() {
   const onConfirm = async () => {
     try {
       const res = await confirmMut.mutateAsync({});
-      // Patch local assignments with the updated rows.
+      // Patch cached assignments with the updated rows.
       const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
-      setAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
+      patchAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
       setConfirmOpen(false);
       // IDs that flipped to confirmed in this batch — what the Undo would target.
       const justConfirmedIds = res.updatedAssignments
@@ -274,14 +302,13 @@ export function SchedulePage() {
     setUnsyncingAssignment(null);
   };
 
-  // After Resolve dialog closes with at least one action taken, patch local
-  // assignments with the returned rows (covers source and target events for
-  // moves) and remove the conflict if the event is now sufficiently staffed.
+  // After Resolve dialog closes with at least one action taken, patch the
+  // cached assignments with the returned rows (covers source and target events
+  // for moves) and remove the conflict if the event is now sufficiently staffed.
   const onResolveResolved = (updatedAssignments: ScheduleAssignment[]) => {
     if (updatedAssignments.length === 0) return;
-    // Group updates by event id, replace local assignments for each.
     const touchedEventIds = new Set(updatedAssignments.map((a) => a.event.id));
-    setAssignments((prev) => {
+    patchAssignments((prev) => {
       const others = prev.filter((a) => !touchedEventIds.has(a.event.id));
       return [...others, ...updatedAssignments].sort(
         (a, b) =>
@@ -304,7 +331,7 @@ export function SchedulePage() {
       if (
         newAssignedCount - previousAssignedCount >= resolvingConflict.short_by
       ) {
-        setConflicts((prev) => prev.filter((c) => c.event_id !== evId));
+        patchConflicts((prev) => prev.filter((c) => c.event_id !== evId));
       }
     }
   };
@@ -315,12 +342,12 @@ export function SchedulePage() {
   ) => {
     if (result.action === "cancelled") {
       // Full cancel: assignments are gone and event is marked cancelled.
-      setAssignments((prev) => prev.filter((a) => a.event.id !== eventId));
+      patchAssignments((prev) => prev.filter((a) => a.event.id !== eventId));
     }
     // For 'reduced': assignments stay as-is; only the event.requiredStaffCount
-    // changed in the DB. Local state doesn't need to track that, the conflict
+    // changed in the DB. Cached state doesn't need to track that, the conflict
     // just goes away.
-    setConflicts((prev) => prev.filter((c) => c.event_id !== eventId));
+    patchConflicts((prev) => prev.filter((c) => c.event_id !== eventId));
     setCancellingConflict(null);
   };
 
@@ -337,7 +364,7 @@ export function SchedulePage() {
   ) => {
     const eventId = updated[0]?.event.id ?? decliningAssignment?.event.id;
     if (replaced && eventId) {
-      setAssignments((prev) => {
+      patchAssignments((prev) => {
         const others = prev.filter((a) => a.event.id !== eventId);
         return [...others, ...updated].sort(
           (a, b) =>
@@ -348,23 +375,16 @@ export function SchedulePage() {
       return;
     }
     // No replacement → regenerate to refresh assignments and conflicts.
-    try {
-      const startISO = new Date(startDate).toISOString();
-      const endISO = new Date(endDate).toISOString();
-      generate.mutate({ startDate: startISO, endDate: endISO });
-    } catch {
-      // If regen fails to even start (invalid range etc.), fall back to local
-      // patch so the declined row at least disappears from the UI.
-      if (eventId) {
-        setAssignments((prev) => prev.filter((a) => a.event.id !== eventId));
-      }
-    }
+    // onGenerate writes the fresh result into the cache on success.
+    onGenerate();
   };
 
   return (
     <div className="p-8 max-w-6xl mx-auto space-y-6">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Schedule</h1>
+        <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
+          <CalendarCheck className="size-6" /> Schedule
+        </h1>
         <p className="text-sm text-muted-foreground">
           Generate a proposed schedule for a date range, review conflicts, then
           confirm to push assignments to staff Outlook calendars.
@@ -485,11 +505,23 @@ export function SchedulePage() {
                 </div>
                 <p className="text-sm text-muted-foreground mt-0.5">
                   Confirm to push events onto each staff member's Outlook calendar.
+                  {conflicts.length > 0 && (
+                    <span className="text-amber-600 ml-1">
+                      {conflicts.length} unresolved conflict
+                      {conflicts.length === 1 ? "" : "s"} — those events will
+                      remain understaffed.
+                    </span>
+                  )}
                 </p>
               </div>
               <Button
                 onClick={() => setConfirmOpen(true)}
                 disabled={confirmMut.isPending}
+                title={
+                  conflicts.length > 0
+                    ? `${proposedCount} assignment${proposedCount === 1 ? "" : "s"} will sync. ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"} remain unresolved — resolve or cancel them first if you don't want to ship a partial schedule.`
+                    : `Push ${proposedCount} assignment${proposedCount === 1 ? "" : "s"} to Outlook`
+                }
               >
                 {confirmMut.isPending ? (
                   <Loader2 className="size-4 animate-spin" />
@@ -501,15 +533,67 @@ export function SchedulePage() {
             </div>
           )}
 
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 space-y-4">
-              <h2 className="text-lg font-medium">Assignments</h2>
-              {grouped.length === 0 && (
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-6 items-start">
+            <div className="min-w-0 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-medium">Assignments</h2>
+                <div className="inline-flex rounded-md border bg-card">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={assignmentsView === "table" ? "default" : "ghost"}
+                    className="rounded-r-none"
+                    onClick={() => setAssignmentsView("table")}
+                  >
+                    <TableIcon className="size-4" /> Table
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={
+                      assignmentsView === "calendar" ? "default" : "ghost"
+                    }
+                    className="rounded-l-none"
+                    onClick={() => setAssignmentsView("calendar")}
+                  >
+                    <CalendarRange className="size-4" /> Calendar
+                  </Button>
+                </div>
+              </div>
+              {assignmentsView === "calendar" && (
+                <>
+                  <ScheduleCalendar
+                    assignments={assignments}
+                    defaultDate={
+                      assignments.length > 0
+                        ? new Date(assignments[0].event.startDateTime)
+                        : new Date(startDate)
+                    }
+                    onSelectAssignment={(a) => setDecliningAssignment(a)}
+                  />
+                  <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+                    <span className="flex items-center gap-1.5">
+                      <span className="inline-block size-3 rounded bg-[rgb(148,163,184)]" />
+                      Proposed
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="inline-block size-3 rounded bg-[rgb(22,163,74)]" />
+                      Synced to Outlook
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="inline-block size-3 rounded bg-[rgb(220,38,38)]" />
+                      Conflict
+                    </span>
+                    <span className="ml-auto">Click an event to decline / replace</span>
+                  </div>
+                </>
+              )}
+              {assignmentsView === "table" && grouped.length === 0 && (
                 <p className="text-sm text-muted-foreground">
                   No assignments were made in this range.
                 </p>
               )}
-              {grouped.map(([day, dayAssignments]) => (
+              {assignmentsView === "table" && grouped.map(([day, dayAssignments]) => (
                 <div key={day} className="border rounded-lg bg-card">
                   <div className="px-4 py-2 border-b text-sm font-medium bg-muted/40">
                     {day}
@@ -576,87 +660,154 @@ export function SchedulePage() {
               ))}
             </div>
 
-            <div className="space-y-4">
-              <div>
-                <h2 className="text-lg font-medium flex items-center gap-2">
-                  <AlertCircle className="size-4 text-destructive" /> Conflicts
-                </h2>
-                {conflicts.length === 0 ? (
-                  <p className="mt-2 text-sm text-muted-foreground flex items-center gap-2">
-                    <CheckCircle2 className="size-4 text-green-600" /> No conflicts.
-                  </p>
-                ) : (
-                  <ul className="mt-2 space-y-2">
-                    {conflicts.map((c, i) => (
-                      <li
-                        key={`${c.event_id}-${i}`}
-                        className="border rounded-md p-3 bg-card text-sm"
-                      >
-                        <Link
-                          to={`/events?focus=${c.event_id}`}
-                          className="font-medium hover:underline"
+            <div className="flex flex-col gap-3 lg:w-auto">
+              {conflictsCollapsed ? (
+                <SectionChicklet
+                  icon={<AlertCircle className="size-5 text-destructive" />}
+                  label="Show Conflicts"
+                  count={conflicts.length}
+                  countTone="destructive"
+                  onClick={() => setConflictsCollapsed(false)}
+                />
+              ) : (
+                <div className="lg:w-72">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-lg font-medium flex items-center gap-2">
+                      <AlertCircle className="size-4 text-destructive" />
+                      Conflicts
+                      {conflicts.length > 0 && (
+                        <Badge variant="destructive" className="ml-1">
+                          {conflicts.length}
+                        </Badge>
+                      )}
+                    </h2>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setConflictsCollapsed(true)}
+                      aria-label="Collapse conflicts"
+                      title="Collapse to free up space"
+                    >
+                      <ChevronRight className="size-4" />
+                    </Button>
+                  </div>
+                  {conflicts.length === 0 ? (
+                    <p className="mt-2 text-sm text-muted-foreground flex items-center gap-2">
+                      <CheckCircle2 className="size-4 text-green-600" /> No conflicts.
+                    </p>
+                  ) : (
+                    <ul className="mt-2 space-y-2">
+                      {conflicts.map((c, i) => (
+                        <li
+                          key={`${c.event_id}-${i}`}
+                          className="border rounded-md p-3 bg-card text-sm"
                         >
-                          {eventTitleById.get(c.event_id) ?? c.event_id}
-                        </Link>
-                        <div className="mt-1 flex items-center gap-2">
-                          <Badge variant="destructive">{REASON_LABEL[c.reason]}</Badge>
-                          <span className="text-muted-foreground">
-                            short {c.short_by}
-                          </span>
-                        </div>
-                        <div className="mt-1 text-muted-foreground text-xs">
-                          {c.message}
-                        </div>
-                        <div className="mt-2 flex gap-1.5">
-                          <Button
-                            size="sm"
-                            variant="default"
-                            onClick={() => setResolvingConflict(c)}
-                            title="See why this conflict exists and rearrange people across events to fix it"
+                          <Link
+                            to={`/events?focus=${c.event_id}`}
+                            className="font-medium hover:underline"
                           >
-                            <Wand2 className="size-3.5" />
-                            Resolve
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => setCancellingConflict(c)}
-                            title="Accept partial coverage (reduces requirement) or cancel the event if nobody is assigned"
-                          >
-                            <Ban className="size-3.5" />
-                            Cancel & archive
-                          </Button>
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
+                            {eventTitleById.get(c.event_id) ?? c.event_id}
+                          </Link>
+                          <div className="mt-1 flex items-center gap-2">
+                            <Badge variant="destructive">{REASON_LABEL[c.reason]}</Badge>
+                            <span className="text-muted-foreground">
+                              short {c.short_by}
+                            </span>
+                          </div>
+                          <div className="mt-1 text-muted-foreground text-xs">
+                            {c.message}
+                          </div>
+                          <div className="mt-2 flex gap-1.5">
+                            <Button
+                              size="sm"
+                              variant="default"
+                              onClick={() => setResolvingConflict(c)}
+                              title="See why this conflict exists and rearrange people across events to fix it"
+                            >
+                              <Wand2 className="size-3.5" />
+                              Resolve
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => setCancellingConflict(c)}
+                              title="Accept partial coverage (reduces requirement) or cancel the event if nobody is assigned"
+                            >
+                              <Ban className="size-3.5" />
+                              Cancel & archive
+                            </Button>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
 
-              <Separator />
+              {!conflictsCollapsed && !warningsCollapsed && <Separator />}
 
-              <div>
-                <h2 className="text-lg font-medium flex items-center gap-2">
-                  <AlertTriangle className="size-4 text-amber-500" /> Warnings
-                </h2>
-                {result.warnings.length === 0 ? (
-                  <p className="mt-2 text-sm text-muted-foreground">No warnings.</p>
-                ) : (
-                  <ul className="mt-2 space-y-2">
-                    {result.warnings.map((w, i) => (
-                      <li
-                        key={i}
-                        className="border rounded-md p-3 bg-card text-sm"
-                      >
-                        <div className="font-medium">{w.type.replace("_", " ")}</div>
-                        <div className="text-muted-foreground text-xs mt-1">
-                          {w.message}
-                        </div>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
+              {warningsCollapsed ? (
+                <SectionChicklet
+                  icon={<AlertTriangle className="size-5 text-amber-500" />}
+                  label="Show Warnings"
+                  count={result.warnings.length}
+                  countTone="warn"
+                  onClick={() => setWarningsCollapsed(false)}
+                />
+              ) : (
+                <div className="lg:w-72">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-lg font-medium flex items-center gap-2">
+                      <AlertTriangle className="size-4 text-amber-500" />
+                      Warnings
+                      {result.warnings.length > 0 && (
+                        <Badge
+                          variant="outline"
+                          className="ml-1 border-amber-500/40 text-amber-600"
+                        >
+                          {result.warnings.length}
+                        </Badge>
+                      )}
+                    </h2>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setWarningsCollapsed(true)}
+                      aria-label="Collapse warnings"
+                      title="Collapse to free up space"
+                    >
+                      <ChevronRight className="size-4" />
+                    </Button>
+                  </div>
+                  {result.warnings.length === 0 ? (
+                    <p className="mt-2 text-sm text-muted-foreground">No warnings.</p>
+                  ) : (
+                    <ul className="mt-2 space-y-2">
+                      {result.warnings.map((w, i) => (
+                        <li
+                          key={i}
+                          className="border rounded-md p-3 bg-card text-sm"
+                        >
+                          <div className="font-medium">
+                            <Link
+                              to={`/people?edit=${w.person_id}`}
+                              className="hover:underline"
+                            >
+                              {w.person_name}
+                            </Link>
+                            <span className="text-muted-foreground font-normal ml-2">
+                              · {w.type.replace("_", " ")}
+                            </span>
+                          </div>
+                          <div className="text-muted-foreground text-xs mt-1">
+                            {w.message}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </>
@@ -773,27 +924,39 @@ export function SchedulePage() {
   );
 }
 
-function SummaryCard({
+function SectionChicklet({
+  icon,
   label,
-  value,
-  tone,
+  count,
+  countTone,
+  onClick,
 }: {
+  icon: ReactNode;
   label: string;
-  value: string;
-  tone?: "good" | "bad";
+  count: number;
+  countTone: "destructive" | "warn";
+  onClick: () => void;
 }) {
-  const toneClass =
-    tone === "good"
-      ? "text-green-600"
-      : tone === "bad"
-        ? "text-destructive"
-        : "text-foreground";
   return (
-    <div className="border rounded-lg bg-card p-3">
-      <div className="text-xs uppercase tracking-wide text-muted-foreground">
-        {label}
-      </div>
-      <div className={`text-2xl font-semibold mt-1 ${toneClass}`}>{value}</div>
-    </div>
+    <button
+      type="button"
+      onClick={onClick}
+      title={`${label} (${count})`}
+      aria-label={`${label} (${count})`}
+      className="relative size-10 border rounded-md bg-card hover:bg-muted flex items-center justify-center self-end shrink-0"
+    >
+      {icon}
+      {count > 0 && (
+        <span
+          className={`absolute -top-1.5 -right-1.5 min-w-5 h-5 px-1 rounded-full text-[10px] font-semibold flex items-center justify-center border ${
+            countTone === "destructive"
+              ? "bg-destructive text-destructive-foreground border-destructive"
+              : "bg-amber-500 text-white border-amber-500"
+          }`}
+        >
+          {count}
+        </span>
+      )}
+    </button>
   );
 }
