@@ -17,6 +17,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useArchive, type ArchiveKind } from "@/features/schedule/useSchedule";
+import { useEvents } from "@/features/events/useEvents";
 
 const KIND_LABEL: Record<ArchiveKind, string> = {
   declined_assignment: "Declined",
@@ -71,6 +72,21 @@ function formatDateTime(iso: string): string {
   });
 }
 
+/** Replace any cuid in an archive reason with its event title — handles
+ *  legacy entries written when the backend stored raw cuids (e.g.
+ *  "Moved to event cmpadte1r0000qmw9dl4h4eu3"). Modern entries already use
+ *  titles and pass through unchanged. */
+function humanizeReason(
+  reason: string,
+  eventTitleById: Map<string, string>,
+): string {
+  // cuid format: starts with 'c', 25 chars of [a-z0-9].
+  return reason.replace(/c[a-z0-9]{24}/g, (id) => {
+    const title = eventTitleById.get(id);
+    return title ? `"${title}"` : "another event";
+  });
+}
+
 function formatEventRange(start: string, end: string): string {
   const s = new Date(start);
   const e = new Date(end);
@@ -85,7 +101,16 @@ function formatEventRange(start: string, end: string): string {
 
 export function ArchivePage() {
   const { data: entries, isLoading, error } = useArchive();
+  // Include cancelled events so historical "Moved to <event>" references still
+  // resolve to a readable title after the target was later cancelled.
+  const { data: events } = useEvents({ includeCancelled: true });
   const [filter, setFilter] = useState<ArchiveKind | "all">("all");
+
+  const eventTitleById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const e of events ?? []) m.set(e.id, e.title);
+    return m;
+  }, [events]);
 
   const filtered = useMemo(() => {
     if (!entries) return [];
@@ -205,7 +230,9 @@ export function ArchivePage() {
                           <strong>{e.newRequiredStaffCount}</strong>
                         </div>
                       )}
-                    {e.reason && <div>{e.reason}</div>}
+                    {e.reason && (
+                      <div>{humanizeReason(e.reason, eventTitleById)}</div>
+                    )}
                     {!e.reason && !e.conflictReason && (
                       <span className="text-muted-foreground text-xs">—</span>
                     )}

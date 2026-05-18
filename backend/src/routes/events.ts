@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { prisma } from "../db.js";
-import { asyncHandler } from "../middleware/error.js";
+import { asyncHandler, HttpError } from "../middleware/error.js";
 import { createEventSchema, updateEventSchema } from "../schemas/event.js";
 
 export const eventsRouter = Router();
@@ -19,14 +19,15 @@ function buildLabelMutation(labelIds: string[] | undefined, mode: "set" | "creat
 eventsRouter.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { from, to } = req.query;
-    const where =
-      from || to
-        ? {
-            startDateTime: from ? { gte: new Date(String(from)) } : undefined,
-            endDateTime: to ? { lte: new Date(String(to)) } : undefined,
-          }
-        : undefined;
+    const { from, to, includeCancelled } = req.query;
+    // Default-exclude cancelled events — they aren't part of any active
+    // schedule. The Events admin page opts in with ?includeCancelled=true so
+    // it can surface and restore them.
+    const wantCancelled = String(includeCancelled ?? "") === "true";
+    const where: Record<string, unknown> = {};
+    if (!wantCancelled) where.cancelledAt = null;
+    if (from) where.startDateTime = { gte: new Date(String(from)) };
+    if (to) where.endDateTime = { lte: new Date(String(to)) };
     const events = await prisma.event.findMany({
       where,
       orderBy: { startDateTime: "asc" },
@@ -85,7 +86,38 @@ eventsRouter.patch(
 eventsRouter.delete(
   "/:id",
   asyncHandler(async (req, res) => {
+    // Hard-delete is only safe when the event has no history. Otherwise the
+    // Prisma cascade would wipe audit entries, assignments, and overrides —
+    // including the trail that explains past staffing decisions.
+    // Admins who want to remove a "live" event should use Cancel & archive
+    // (sets cancelledAt, preserves history, can be restored).
+    const [assignmentCount, archiveCount, overrideCount] = await Promise.all([
+      prisma.assignment.count({ where: { eventId: req.params.id } }),
+      prisma.archiveEntry.count({ where: { eventId: req.params.id } }),
+      prisma.overrideRequest.count({ where: { eventId: req.params.id } }),
+    ]);
+    if (assignmentCount + archiveCount + overrideCount > 0) {
+      throw new HttpError(
+        409,
+        `This event has ${assignmentCount} assignment${assignmentCount === 1 ? "" : "s"}, ${archiveCount} archive entr${archiveCount === 1 ? "y" : "ies"}, and ${overrideCount} override request${overrideCount === 1 ? "" : "s"}. Use Cancel & archive instead of Delete to preserve history.`,
+      );
+    }
     await prisma.event.delete({ where: { id: req.params.id } });
     res.status(204).end();
+  }),
+);
+
+// Restore a cancelled event — clears cancelledAt + cancellationReason so the
+// solver picks it back up on the next Generate. Inverse of the Schedule's
+// "Cancel & archive" action.
+eventsRouter.post(
+  "/:id/restore",
+  asyncHandler(async (req, res) => {
+    const event = await prisma.event.update({
+      where: { id: req.params.id },
+      data: { cancelledAt: null, cancellationReason: null },
+      include: eventInclude,
+    });
+    res.json(event);
   }),
 );

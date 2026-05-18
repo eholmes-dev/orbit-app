@@ -1,34 +1,16 @@
-import { useMemo, useState, type ReactNode } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
-  Play,
-  AlertTriangle,
-  AlertCircle,
-  CheckCircle2,
-  Send,
-  UserX,
+  CalendarCheck,
+  ChevronLeft,
+  ChevronRight,
+  ChevronDown,
   Loader2,
-  Wand2,
-  Ban,
   CloudOff,
   Table as TableIcon,
-  CalendarRange,
-  CalendarCheck,
-  ChevronRight,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { DateTimeInput } from "@/components/DateTimeInput";
-import { Separator } from "@/components/ui/separator";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -39,26 +21,38 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useGenerateSchedule,
   useConfirmSchedule,
   useUnconfirmAssignments,
+  useAcceptConflict,
+  useDeleteAssignment,
+  useScheduleAssignments,
+  useAllAssignments,
+  invalidateScheduleAssignments,
 } from "@/features/schedule/useSchedule";
 import { DeclineAssignmentDialog } from "@/features/schedule/DeclineAssignmentDialog";
 import { CancelConflictDialog } from "@/features/schedule/CancelConflictDialog";
 import { ResolveConflictDialog } from "@/features/schedule/ResolveConflictDialog";
-import { ScheduleCalendar } from "@/features/schedule/ScheduleCalendar";
+import { WeekGrid } from "@/features/schedule/WeekGrid";
+import { DayGrid } from "@/features/schedule/DayGrid";
+import { MonthGrid } from "@/features/schedule/MonthGrid";
+import { SchedulingAssistant } from "@/features/schedule/SchedulingAssistant";
+import { ConflictsPanel } from "@/features/schedule/ConflictsPanel";
+import { WarningsPanel } from "@/features/schedule/WarningsPanel";
+import { ProposedAssignmentsTable } from "@/features/schedule/ProposedAssignmentsTable";
+import { Badge } from "@/components/ui/badge";
 import {
   useScheduleView,
   useScheduleViewActions,
 } from "@/features/schedule/useScheduleView";
 import { useEvents } from "@/features/events/useEvents";
-import { SummaryCard } from "@/components/SummaryCard";
+import { usePeople } from "@/features/people/usePeople";
 import type {
   ScheduleAssignment,
   ScheduleConflict,
-  ConflictReason,
-  AssignmentStatus,
+  Event,
 } from "@/lib/types";
 
 function todayLocal(): string {
@@ -79,6 +73,106 @@ function localStr(d: Date, time: "00:00" | "23:59"): string {
   return new Date(d.getTime() - tz).toISOString().slice(0, 10) + "T" + time;
 }
 
+function startOfWeekMonday(d: Date): Date {
+  const date = new Date(d);
+  date.setHours(0, 0, 0, 0);
+  const day = date.getDay();
+  const mondayOffset = day === 0 ? -6 : 1 - day;
+  date.setDate(date.getDate() + mondayOffset);
+  return date;
+}
+
+type CalendarView = "week" | "day" | "month";
+
+// Calendar UI state that should survive tab-to-tab navigation (and refresh,
+// since sessionStorage persists through reload) but reset on tab close —
+// admins shouldn't come back to an arbitrary Wednesday from a previous session.
+const VIEW_STATE_KEY = "orbit.scheduleViewState";
+interface PersistedViewState {
+  view?: CalendarView;
+  dateISO?: string;
+  tableOpen?: boolean;
+}
+function readViewState(): PersistedViewState {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.sessionStorage.getItem(VIEW_STATE_KEY);
+    return raw ? (JSON.parse(raw) as PersistedViewState) : {};
+  } catch {
+    return {};
+  }
+}
+function writeViewState(state: PersistedViewState) {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(VIEW_STATE_KEY, JSON.stringify(state));
+  } catch {
+    // sessionStorage may be disabled / full — silently skip.
+  }
+}
+
+/** The date range a given view is currently looking at. Used both to title
+ *  the toolbar and to scope the live assignments / events queries.
+ *  For Month view we include the full 6-week grid (which can spill into the
+ *  prior / next month) so events on those spillover days still load. */
+function rangeForView(view: CalendarView, anchor: Date): { start: Date; end: Date } {
+  if (view === "day") {
+    const start = new Date(anchor);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 1);
+    return { start, end };
+  }
+  if (view === "month") {
+    const first = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+    const gridStart = new Date(first);
+    gridStart.setDate(gridStart.getDate() - first.getDay());
+    gridStart.setHours(0, 0, 0, 0);
+    const gridEnd = new Date(gridStart);
+    gridEnd.setDate(gridEnd.getDate() + 42);
+    return { start: gridStart, end: gridEnd };
+  }
+  // week
+  const start = startOfWeekMonday(anchor);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  return { start, end };
+}
+
+function advanceDate(view: CalendarView, anchor: Date, delta: -1 | 1): Date {
+  const d = new Date(anchor);
+  if (view === "day") d.setDate(d.getDate() + delta);
+  else if (view === "month") d.setMonth(d.getMonth() + delta);
+  else d.setDate(d.getDate() + delta * 7);
+  return d;
+}
+
+function formatViewLabel(view: CalendarView, d: Date): string {
+  if (view === "day") {
+    return d.toLocaleDateString(undefined, {
+      weekday: "long",
+      month: "long",
+      day: "numeric",
+      year: "numeric",
+    });
+  }
+  if (view === "month") {
+    return d.toLocaleDateString(undefined, {
+      month: "long",
+      year: "numeric",
+    });
+  }
+  const start = startOfWeekMonday(d);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  const fmt: Intl.DateTimeFormatOptions = { month: "short", day: "numeric" };
+  const sameMonth = start.getMonth() === end.getMonth();
+  if (sameMonth) {
+    return `${start.toLocaleDateString(undefined, fmt)} – ${end.getDate()}, ${end.getFullYear()}`;
+  }
+  return `${start.toLocaleDateString(undefined, fmt)} – ${end.toLocaleDateString(undefined, fmt)}, ${end.getFullYear()}`;
+}
+
 function thisWeekRange(from: Date = new Date()): [string, string] {
   const start = new Date(from);
   const day = start.getDay();
@@ -96,56 +190,9 @@ function monthRange(monthsAhead: number): [string, string] {
   return [localStr(start, "00:00"), localStr(end, "23:59")];
 }
 
-function formatRange(start: string, end: string): string {
-  const s = new Date(start);
-  const e = new Date(end);
-  const dateFmt: Intl.DateTimeFormatOptions = { weekday: "short", month: "short", day: "numeric" };
-  const timeFmt: Intl.DateTimeFormatOptions = { hour: "numeric", minute: "2-digit" };
-  const sameDay = s.toDateString() === e.toDateString();
-  if (sameDay) {
-    return `${s.toLocaleDateString(undefined, dateFmt)} · ${s.toLocaleTimeString(undefined, timeFmt)} – ${e.toLocaleTimeString(undefined, timeFmt)}`;
-  }
-  return `${s.toLocaleString(undefined, { ...dateFmt, ...timeFmt })} – ${e.toLocaleString(undefined, { ...dateFmt, ...timeFmt })}`;
-}
-
-const REASON_LABEL: Record<ConflictReason, string> = {
-  no_qualified_staff: "No qualified staff",
-  no_availability: "No availability",
-  capacity_exhausted: "Capacity exhausted",
-  over_constrained: "Over-constrained",
-};
-
-function groupByDay(assignments: ScheduleAssignment[]) {
-  const groups = new Map<string, ScheduleAssignment[]>();
-  for (const a of assignments) {
-    const day = new Date(a.event.startDateTime).toDateString();
-    const list = groups.get(day) ?? [];
-    list.push(a);
-    groups.set(day, list);
-  }
-  return Array.from(groups.entries()).sort(
-    ([a], [b]) => new Date(a).getTime() - new Date(b).getTime(),
-  );
-}
-
-function statusBadge(status: AssignmentStatus) {
-  if (status === "confirmed") {
-    return (
-      <Badge className="bg-green-600 hover:bg-green-600">
-        <CheckCircle2 className="size-3 mr-1" /> Synced
-      </Badge>
-    );
-  }
-  if (status === "conflict") {
-    return <Badge variant="destructive">Conflict</Badge>;
-  }
-  return <Badge variant="secondary">Proposed</Badge>;
-}
-
 export function SchedulePage() {
   const view = useScheduleView();
-  const { setView, patchAssignments, patchConflicts } =
-    useScheduleViewActions();
+  const { setView, patchConflicts } = useScheduleViewActions();
   const cached = view.data;
   // The schedule view lives in the TanStack Query cache so it survives
   // navigation. Date inputs seed from the cached range on mount, then are
@@ -161,9 +208,63 @@ export function SchedulePage() {
   const generate = useGenerateSchedule();
   const confirmMut = useConfirmSchedule();
   const unconfirmMut = useUnconfirmAssignments();
+  const acceptConflictMut = useAcceptConflict();
+  const deleteAssignmentMut = useDeleteAssignment();
+  const qc = useQueryClient();
 
-  const assignments = cached?.assignments ?? [];
-  const conflicts = cached?.conflicts ?? [];
+  // Soft-delete a proposed assignment — no decline trail, so the solver can
+  // re-suggest the same person on the next Generate. Live queries refetch so
+  // the event drops from the grid and (if now under-staffed) lands in
+  // Conflicts automatically.
+  const onRemoveAssignment = async (a: ScheduleAssignment) => {
+    try {
+      await deleteAssignmentMut.mutateAsync(a.id);
+      invalidateScheduleAssignments(qc);
+      toast.success(`Removed ${a.person.name} from "${a.event.title}"`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to remove");
+    }
+  };
+
+  // Accept a partial conflict — backend drops the event's requiredStaffCount
+  // to match the currently-assigned headcount AND records an archive entry.
+  // The conflict disappears from the panel; future generates won't re-flag it.
+  // Invalidates the events query so the new requiredStaffCount surfaces in
+  // the Events row + Events page.
+  const onAcceptConflict = async (c: ScheduleConflict) => {
+    try {
+      const result = await acceptConflictMut.mutateAsync({
+        eventId: c.event_id,
+        conflictReason: c.reason,
+        conflictShortBy: c.short_by,
+      });
+      patchConflicts((prev) => prev.filter((x) => x.event_id !== c.event_id));
+      qc.invalidateQueries({ queryKey: ["events"] });
+      toast.success(
+        `Accepted as partial — staffing requirement reduced from ${result.previousRequiredStaffCount} to ${result.newRequiredStaffCount}`,
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to accept");
+    }
+  };
+
+  // Clicking an unassigned event chip opens the existing Resolve dialog so
+  // the admin can pick a person. The dialog needs a ScheduleConflict shape;
+  // we synthesize one from the event's current fill state. Reason is set to
+  // "capacity_exhausted" as a neutral placeholder — the dialog doesn't
+  // branch on reason, it just fetches candidates.
+  const onSelectEvent = (event: Event) => {
+    const assignedCount = assignments.filter(
+      (a) => a.event.id === event.id,
+    ).length;
+    const shortBy = Math.max(0, event.requiredStaffCount - assignedCount);
+    setResolvingConflict({
+      event_id: event.id,
+      reason: "capacity_exhausted",
+      short_by: shortBy,
+      message: `${assignedCount}/${event.requiredStaffCount} filled — pick a person to assign.`,
+    });
+  };
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [decliningAssignment, setDecliningAssignment] =
@@ -174,27 +275,159 @@ export function SchedulePage() {
     useState<ScheduleConflict | null>(null);
   const [unsyncingAssignment, setUnsyncingAssignment] =
     useState<ScheduleAssignment | null>(null);
-  const [assignmentsView, setAssignmentsView] = useState<"table" | "calendar">(
-    "table",
+
+  // Calendar view — each has a custom grid. Toolbar nav (Today / ‹ / ›) is
+  // view-aware via advanceDate(). Persisted to sessionStorage so navigating
+  // away to People/Availability/etc. and back lands you in the same view.
+  const persistedView = useMemo(() => readViewState(), []);
+  const [currentView, setCurrentView] = useState<CalendarView>(
+    persistedView.view ?? "week",
   );
-  // Per-section collapse for Conflicts and Warnings. A collapsed section
-  // shrinks to a small icon chicklet pinned to the right edge so the
-  // Assignments / Calendar view dynamically reclaims the freed width.
-  const [conflictsCollapsed, setConflictsCollapsed] = useState(false);
-  const [warningsCollapsed, setWarningsCollapsed] = useState(false);
+  // Below-the-grid table of all assignments grouped by day. Collapsed by
+  // default so the calendar dominates; admins expand it to scan/manage
+  // specific assignments (per-row unsync + decline actions).
+  const [assignmentsTableOpen, setAssignmentsTableOpen] = useState(
+    persistedView.tableOpen ?? false,
+  );
+  // Defaults to today's week; persisted across tab navigation so admins keep
+  // the week they were last looking at.
+  const [currentDate, setCurrentDate] = useState<Date>(() =>
+    persistedView.dateISO ? new Date(persistedView.dateISO) : new Date(),
+  );
+
+  // Mirror the three view-state slots to sessionStorage on every change.
+  useEffect(() => {
+    writeViewState({
+      view: currentView,
+      dateISO: currentDate.toISOString(),
+      tableOpen: assignmentsTableOpen,
+    });
+  }, [currentView, currentDate, assignmentsTableOpen]);
+
+  const { data: people } = usePeople();
+  const activePeople = useMemo(
+    () => (people ?? []).filter((p) => p.active),
+    [people],
+  );
 
   const result = cached;
-  const grouped = useMemo(() => groupByDay(assignments), [assignments]);
-  const proposedCount = useMemo(
-    () => assignments.filter((a) => a.status === "proposed").length,
-    [assignments],
+
+  // Live assignments for the visible view range — independent of whatever
+  // range was last Generated. Navigating to a different week / day / month
+  // refetches that range's assignments from the DB.
+  const viewRange = useMemo(
+    () => rangeForView(currentView, currentDate),
+    [currentView, currentDate],
+  );
+  const { data: liveAssignments } = useScheduleAssignments(
+    viewRange.start.toISOString(),
+    viewRange.end.toISOString(),
+  );
+  const assignments = liveAssignments ?? [];
+
+  // All proposed assignments across the entire DB — drives the collapsible
+  // "Assignments" table below the grid. Lets admins see (and click through to)
+  // proposed rows that aren't in the currently visible week.
+  const { data: allAssignmentsRaw } = useAllAssignments();
+  const allProposedAssignments = useMemo(
+    () => (allAssignmentsRaw ?? []).filter((a) => a.status === "proposed"),
+    [allAssignmentsRaw],
   );
 
-  const eventTitleById = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const e of events ?? []) m.set(e.id, e.title);
+  // Non-declined assignment count per event id — drives the "X of Y filled"
+  // text and the Accept-partial affordance in ConflictsPanel. Built off the
+  // across-DB view so a conflict on a future week still gets an accurate count.
+  const assignedCountByEventId = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of allAssignmentsRaw ?? []) {
+      m.set(a.event.id, (m.get(a.event.id) ?? 0) + 1);
+    }
+    return m;
+  }, [allAssignmentsRaw]);
+
+  // Conflicts are derived from live state (events + current assigned counts),
+  // not the cached generate snapshot. The cache used to drive this directly,
+  // but it doesn't survive post-generate edits — declining or deleting an
+  // assignment after Generate would leave a stale "no conflict" cache while
+  // the event was actually unfilled. We still pull the `reason` from the
+  // cached snapshot when present so the solver's categorization survives.
+  const liveConflicts = useMemo<ScheduleConflict[]>(() => {
+    if (!events) return [];
+    // Only score events that were in scope of the last generate. Events
+    // outside that range aren't "the schedule you're working on" yet — they
+    // surface on the next Generate. With no cached range, no conflicts.
+    if (!cached?.range) return [];
+    const rangeStart = new Date(cached.range.startDate).getTime();
+    const rangeEnd = new Date(cached.range.endDate).getTime();
+    const cachedReasonById = new Map(
+      (cached.conflicts ?? []).map((c) => [c.event_id, c.reason]),
+    );
+    return events
+      .filter((e) => {
+        if (e.cancelledAt) return false;
+        const eStart = new Date(e.startDateTime).getTime();
+        if (eStart < rangeStart || eStart >= rangeEnd) return false;
+        const assignedCount = assignedCountByEventId.get(e.id) ?? 0;
+        return assignedCount < e.requiredStaffCount;
+      })
+      .sort(
+        (a, b) =>
+          new Date(a.startDateTime).getTime() -
+          new Date(b.startDateTime).getTime(),
+      )
+      .map((e) => {
+        const assignedCount = assignedCountByEventId.get(e.id) ?? 0;
+        const shortBy = e.requiredStaffCount - assignedCount;
+        return {
+          event_id: e.id,
+          reason: cachedReasonById.get(e.id) ?? "capacity_exhausted",
+          short_by: shortBy,
+          message: `Short by ${shortBy} — ${assignedCount} of ${e.requiredStaffCount} filled.`,
+        };
+      });
+  }, [events, assignedCountByEventId, cached]);
+
+  // Conflicts panel + the assistant's conflict count read from this. Driven
+  // by live state, so post-generate edits stay accurate.
+  const conflicts = liveConflicts;
+
+  // Publish acts on EVERY proposed assignment in the DB, so the button's
+  // enabled state and count must reflect that — not just what's visible in
+  // the current view's range. Otherwise switching to a day/week with no
+  // pending shifts disables Publish even when other weeks still have some.
+  const proposedCount = allProposedAssignments.length;
+
+  const eventsById = useMemo(() => {
+    const m = new Map<string, Event>();
+    for (const e of events ?? []) m.set(e.id, e);
     return m;
   }, [events]);
+
+  // Events that start in the visible view range. Cancelled events are filtered
+  // out — they're not part of the solver's input and showing them in the grid
+  // creates phantom "0/N" rows that can never be resolved.
+  const visibleEvents = useMemo(() => {
+    if (!events) return [];
+    return events.filter((e) => {
+      if (e.cancelledAt) return false;
+      const eStart = new Date(e.startDateTime);
+      return eStart >= viewRange.start && eStart < viewRange.end;
+    });
+  }, [events, viewRange.start, viewRange.end]);
+
+  // Events still needing at least one more person — drives the Week and Day
+  // top Events rows. Month view shows ALL visible events (per spec).
+  const unassignedEvents = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of assignments) {
+      counts.set(a.event.id, (counts.get(a.event.id) ?? 0) + 1);
+    }
+    return visibleEvents.filter(
+      (e) => (counts.get(e.id) ?? 0) < e.requiredStaffCount,
+    );
+  }, [visibleEvents, assignments]);
+
+  const navigate = useNavigate();
 
   const onGenerate = async () => {
     try {
@@ -204,13 +437,15 @@ export function SchedulePage() {
         startDate: startISO,
         endDate: endISO,
       });
-      // Replace the cached view. This is the only place a new view is seeded —
-      // everything else patches in place.
+      // Replace the cached view (drives conflicts/warnings in the Assistant).
       setView({
         ...res,
         range: { startDate, endDate },
         generatedAt: new Date().toISOString(),
       });
+      // Refresh the live week's assignments so the grid reflects the solver
+      // output immediately.
+      invalidateScheduleAssignments(qc);
       toast.success("Schedule generated");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to generate schedule");
@@ -227,8 +462,7 @@ export function SchedulePage() {
     if (assignmentIds.length === 0) return;
     try {
       const res = await unconfirmMut.mutateAsync({ assignmentIds });
-      const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
-      patchAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
+      invalidateScheduleAssignments(qc);
       if (res.failed > 0) {
         toast.warning(
           `${res.unconfirmed} unsynced, ${res.failed} failed. Outlook may be partially out of sync.`,
@@ -244,9 +478,7 @@ export function SchedulePage() {
   const onConfirm = async () => {
     try {
       const res = await confirmMut.mutateAsync({});
-      // Patch cached assignments with the updated rows.
-      const updates = new Map(res.updatedAssignments.map((a) => [a.id, a]));
-      patchAssignments((prev) => prev.map((a) => updates.get(a.id) ?? a));
+      invalidateScheduleAssignments(qc);
       setConfirmOpen(false);
       // IDs that flipped to confirmed in this batch — what the Undo would target.
       const justConfirmedIds = res.updatedAssignments
@@ -302,20 +534,12 @@ export function SchedulePage() {
     setUnsyncingAssignment(null);
   };
 
-  // After Resolve dialog closes with at least one action taken, patch the
-  // cached assignments with the returned rows (covers source and target events
-  // for moves) and remove the conflict if the event is now sufficiently staffed.
+  // After Resolve dialog closes with at least one action taken, refresh the
+  // live week and clear the conflict from the Assistant panel if the event
+  // is now sufficiently staffed.
   const onResolveResolved = (updatedAssignments: ScheduleAssignment[]) => {
     if (updatedAssignments.length === 0) return;
-    const touchedEventIds = new Set(updatedAssignments.map((a) => a.event.id));
-    patchAssignments((prev) => {
-      const others = prev.filter((a) => !touchedEventIds.has(a.event.id));
-      return [...others, ...updatedAssignments].sort(
-        (a, b) =>
-          new Date(a.event.startDateTime).getTime() -
-          new Date(b.event.startDateTime).getTime(),
-      );
-    });
+    invalidateScheduleAssignments(qc);
     // If we added enough new assignments to the resolved event to cover the
     // shortfall, clear the conflict from the panel. Other events that were
     // touched (e.g. the source of a move) might be newly under-staffed —
@@ -338,15 +562,14 @@ export function SchedulePage() {
 
   const onCancelConflictSuccess = (
     eventId: string,
-    result: import("@/features/schedule/useSchedule").CancelConflictResult,
+    _result: import("@/features/schedule/useSchedule").CancelConflictResult,
   ) => {
-    if (result.action === "cancelled") {
-      // Full cancel: assignments are gone and event is marked cancelled.
-      patchAssignments((prev) => prev.filter((a) => a.event.id !== eventId));
-    }
-    // For 'reduced': assignments stay as-is; only the event.requiredStaffCount
-    // changed in the DB. Cached state doesn't need to track that, the conflict
-    // just goes away.
+    // Whether cancelled (sets event.cancelledAt) or reduced (changes
+    // event.requiredStaffCount), both mutate the Event row — invalidate the
+    // events query too so the Events page badge / Schedule grid filter reflect
+    // the new state.
+    invalidateScheduleAssignments(qc);
+    qc.invalidateQueries({ queryKey: ["events"] });
     patchConflicts((prev) => prev.filter((c) => c.event_id !== eventId));
     setCancellingConflict(null);
   };
@@ -359,459 +582,222 @@ export function SchedulePage() {
   //   uncovered event surfaces in conflicts (and other downstream effects
   //   recompute).
   const onDeclineResolved = (
-    updated: ScheduleAssignment[],
+    _updated: ScheduleAssignment[],
     replaced: boolean,
   ) => {
-    const eventId = updated[0]?.event.id ?? decliningAssignment?.event.id;
-    if (replaced && eventId) {
-      patchAssignments((prev) => {
-        const others = prev.filter((a) => a.event.id !== eventId);
-        return [...others, ...updated].sort(
-          (a, b) =>
-            new Date(a.event.startDateTime).getTime() -
-            new Date(b.event.startDateTime).getTime(),
-        );
-      });
-      return;
-    }
-    // No replacement → regenerate to refresh assignments and conflicts.
-    // onGenerate writes the fresh result into the cache on success.
+    // Either way the live grid needs a refresh.
+    invalidateScheduleAssignments(qc);
+    if (replaced) return;
+    // No replacement → regenerate so the now-uncovered event surfaces as a
+    // conflict in the Assistant panel.
     onGenerate();
   };
 
   return (
-    <div className="p-8 max-w-6xl mx-auto space-y-6">
+    <div className="p-8 max-w-(--breakpoint-2xl) mx-auto space-y-4">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight flex items-center gap-2">
           <CalendarCheck className="size-6" /> Schedule
         </h1>
         <p className="text-sm text-muted-foreground">
-          Generate a proposed schedule for a date range, review conflicts, then
-          confirm to push assignments to staff Outlook calendars.
+          Plan staff coverage across events. Use the Assistant on the right to
+          set a date range, generate, resolve conflicts, and publish to Outlook.
         </p>
       </div>
 
-      <div className="border rounded-lg bg-card p-4 space-y-3">
-        <div className="flex flex-wrap gap-2">
-          <span className="text-xs text-muted-foreground self-center mr-1">
-            Quick range:
-          </span>
-          {(
-            [
+      <div className="flex gap-4 items-start">
+        {/* Left: calendar grid */}
+        <div className="flex-1 min-w-0 space-y-3">
+          {/* Toolbar: view-aware navigation + view toggle. Today / ‹ / › step
+              the visible range by the current view's unit (day / week / month). */}
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setCurrentDate(new Date())}
+              >
+                Today
+              </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() =>
+                  setCurrentDate(advanceDate(currentView, currentDate, -1))
+                }
+                aria-label={`Previous ${currentView}`}
+              >
+                <ChevronLeft className="size-4" />
+              </Button>
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={() =>
+                  setCurrentDate(advanceDate(currentView, currentDate, 1))
+                }
+                aria-label={`Next ${currentView}`}
+              >
+                <ChevronRight className="size-4" />
+              </Button>
+              <span className="font-medium text-sm ml-1">
+                {formatViewLabel(currentView, currentDate)}
+              </span>
+            </div>
+            <div className="inline-flex rounded-md border bg-card">
+              {(["week", "day", "month"] as const).map((v, i, arr) => (
+                <Button
+                  key={v}
+                  size="sm"
+                  variant={currentView === v ? "default" : "ghost"}
+                  className={`capitalize ${
+                    i === 0
+                      ? "rounded-r-none"
+                      : i === arr.length - 1
+                        ? "rounded-l-none"
+                        : "rounded-none"
+                  }`}
+                  onClick={() => setCurrentView(v)}
+                >
+                  {v}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          {/* The grid is always rendered — even with no schedule generated,
+              it shows people, the visible range's events (in the top row),
+              and any existing assignments from the DB. */}
+          {currentView === "week" && (
+            <WeekGrid
+              weekStart={currentDate}
+              people={activePeople}
+              assignments={assignments}
+              events={unassignedEvents}
+              onSelectAssignment={(a) => setDecliningAssignment(a)}
+              onSelectEvent={onSelectEvent}
+            />
+          )}
+          {currentView === "day" && (
+            <DayGrid
+              date={currentDate}
+              people={activePeople}
+              assignments={assignments}
+              events={unassignedEvents}
+              onSelectAssignment={(a) => setDecliningAssignment(a)}
+              onSelectEvent={onSelectEvent}
+            />
+          )}
+          {currentView === "month" && (
+            <MonthGrid
+              date={currentDate}
+              events={visibleEvents}
+              assignedCountByEventId={assignedCountByEventId}
+              onSelectEvent={onSelectEvent}
+              onSelectDay={(d) => {
+                setCurrentDate(d);
+                setCurrentView("day");
+              }}
+            />
+          )}
+
+          {/* Collapsible "Assignments" table — every proposed assignment in the
+              DB, regardless of the current calendar view. Click a row to jump
+              the calendar to that week. Default collapsed. */}
+          {allProposedAssignments.length > 0 && (
+            <div className="border rounded-lg bg-card">
+              <button
+                type="button"
+                onClick={() => setAssignmentsTableOpen((v) => !v)}
+                className="w-full flex items-center justify-between gap-3 p-3 hover:bg-muted/40 transition rounded-lg"
+                aria-expanded={assignmentsTableOpen}
+              >
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <TableIcon className="size-4 text-muted-foreground" />
+                  Proposed Assignments
+                  <Badge variant="secondary" className="ml-1">
+                    {allProposedAssignments.length}
+                  </Badge>
+                </div>
+                {assignmentsTableOpen ? (
+                  <ChevronDown className="size-4 text-muted-foreground" />
+                ) : (
+                  <ChevronRight className="size-4 text-muted-foreground" />
+                )}
+              </button>
+              {assignmentsTableOpen && (
+                <div className="p-3 border-t">
+                  <ProposedAssignmentsTable
+                    assignments={allProposedAssignments}
+                    onUnsync={(a) => setUnsyncingAssignment(a)}
+                    onDecline={(a) => setDecliningAssignment(a)}
+                    onRemove={onRemoveAssignment}
+                    onRowClick={(a) => {
+                      // Jump the calendar to the assignment's week + force
+                      // Week view (Day/Month aren't custom yet, so a row
+                      // click from there is most useful as a week jump).
+                      setCurrentDate(new Date(a.event.startDateTime));
+                      setCurrentView("week");
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Right column: Assistant + Conflicts/Warnings panels stacked under it */}
+        <div className="w-80 shrink-0 space-y-3">
+          <SchedulingAssistant
+            startDate={startDate}
+            endDate={endDate}
+            onChangeStartDate={setStartDate}
+            onChangeEndDate={setEndDate}
+            onQuickRange={([s, e]) => {
+              setStartDate(s);
+              setEndDate(e);
+            }}
+            quickRanges={[
               ["This week", () => thisWeekRange()],
               ["This month", () => monthRange(0)],
               ["Next month", () => monthRange(1)],
-              ["Next 30 days", () => [todayLocal(), plusDaysLocal(30)] as [string, string]],
-            ] as const
-          ).map(([label, fn]) => (
-            <Button
-              key={label}
-              size="sm"
-              variant="outline"
-              type="button"
-              onClick={() => {
-                const [s, e] = fn();
-                setStartDate(s);
-                setEndDate(e);
-              }}
-            >
-              {label}
-            </Button>
-          ))}
-        </div>
-        <div className="flex items-end gap-4">
-          <div className="flex-1">
-            <label className="text-sm font-medium mb-1.5 block">Start</label>
-            <DateTimeInput value={startDate} onChange={setStartDate} />
-          </div>
-          <div className="flex-1">
-            <label className="text-sm font-medium mb-1.5 block">End</label>
-            <DateTimeInput value={endDate} onChange={setEndDate} />
-          </div>
-          <Button onClick={onGenerate} disabled={generate.isPending}>
-            <Play className="size-4" />
-            {generate.isPending ? "Solving…" : "Generate"}
-          </Button>
+              ["Next 30 days", () => [todayLocal(), plusDaysLocal(30)]],
+            ]}
+            view={result ?? null}
+            viewRange={cached?.range}
+            viewGeneratedAt={cached?.generatedAt}
+            isGenerating={generate.isPending}
+            generateError={
+              generate.error instanceof Error ? generate.error.message : null
+            }
+            onGenerate={onGenerate}
+            proposedCount={proposedCount}
+            conflictsCount={conflicts.length}
+            isPublishing={confirmMut.isPending}
+            onPublish={() => setConfirmOpen(true)}
+          />
+
+          {/* Conflicts + Warnings — separate cards underneath. Shown whenever a
+              generate result exists in the session; empty states make it
+              clear when nothing's flagged. */}
+          {result && (
+            <>
+              <ConflictsPanel
+                conflicts={conflicts}
+                eventsById={eventsById}
+                assignedCountByEventId={assignedCountByEventId}
+                onResolve={(c) => setResolvingConflict(c)}
+                onCancel={(c) => setCancellingConflict(c)}
+                onAccept={onAcceptConflict}
+              />
+              <WarningsPanel
+                warnings={result.warnings}
+                onOpenPerson={(id) => navigate(`/people?edit=${id}`)}
+              />
+            </>
+          )}
         </div>
       </div>
 
-      {generate.isPending && (
-        <p className="text-muted-foreground text-sm">
-          The solver runs server-side and can take up to 10 seconds…
-        </p>
-      )}
-
-      {generate.error && (
-        <p className="text-destructive">
-          {generate.error instanceof Error ? generate.error.message : "Solver failed"}
-        </p>
-      )}
-
-      {result && result.counts.events === 0 && (
-        <div className="border rounded-lg bg-card p-8 text-center">
-          <h2 className="text-lg font-medium">No events in this range</h2>
-          <p className="text-sm text-muted-foreground mt-2 max-w-md mx-auto">
-            The solver had nothing to schedule. Add events covering this date
-            range, or widen the range above.
-          </p>
-          <Button asChild className="mt-4">
-            <Link to="/events">Go to Events</Link>
-          </Button>
-        </div>
-      )}
-
-      {result &&
-        result.counts.events > 0 &&
-        (result.status === "infeasible" || result.status === "unknown") && (
-          <div className="border border-destructive/40 rounded-lg bg-destructive/5 p-4 flex items-start gap-3">
-            <AlertCircle className="size-5 text-destructive shrink-0 mt-0.5" />
-            <div>
-              <div className="font-medium">
-                Solver returned: {result.status}
-              </div>
-              <p className="text-sm text-muted-foreground mt-1">
-                The current constraints can't be satisfied. Common causes: an
-                event has fewer qualified+available people than its required
-                staff count, or two hard-requirement events overlap for the
-                only person who could cover both.
-              </p>
-            </div>
-          </div>
-        )}
-
-      {result && result.counts.events > 0 && (
-        <>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-            <SummaryCard label="Solver" value={result.status} />
-            <SummaryCard label="People" value={String(result.counts.people)} />
-            <SummaryCard label="Events" value={String(result.counts.events)} />
-            <SummaryCard
-              label="Assigned"
-              value={String(result.counts.assignments)}
-              tone="good"
-            />
-            <SummaryCard
-              label="Conflicts"
-              value={String(result.counts.conflicts)}
-              tone={result.counts.conflicts > 0 ? "bad" : "good"}
-            />
-          </div>
-
-          {proposedCount > 0 && (
-            <div className="flex items-center justify-between border rounded-lg bg-card p-4">
-              <div>
-                <div className="font-medium">
-                  {proposedCount} proposed assignment{proposedCount === 1 ? "" : "s"} pending
-                </div>
-                <p className="text-sm text-muted-foreground mt-0.5">
-                  Confirm to push events onto each staff member's Outlook calendar.
-                  {conflicts.length > 0 && (
-                    <span className="text-amber-600 ml-1">
-                      {conflicts.length} unresolved conflict
-                      {conflicts.length === 1 ? "" : "s"} — those events will
-                      remain understaffed.
-                    </span>
-                  )}
-                </p>
-              </div>
-              <Button
-                onClick={() => setConfirmOpen(true)}
-                disabled={confirmMut.isPending}
-                title={
-                  conflicts.length > 0
-                    ? `${proposedCount} assignment${proposedCount === 1 ? "" : "s"} will sync. ${conflicts.length} conflict${conflicts.length === 1 ? "" : "s"} remain unresolved — resolve or cancel them first if you don't want to ship a partial schedule.`
-                    : `Push ${proposedCount} assignment${proposedCount === 1 ? "" : "s"} to Outlook`
-                }
-              >
-                {confirmMut.isPending ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Send className="size-4" />
-                )}
-                {confirmMut.isPending ? "Syncing…" : "Confirm & sync to Outlook"}
-              </Button>
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-6 items-start">
-            <div className="min-w-0 space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-medium">Assignments</h2>
-                <div className="inline-flex rounded-md border bg-card">
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant={assignmentsView === "table" ? "default" : "ghost"}
-                    className="rounded-r-none"
-                    onClick={() => setAssignmentsView("table")}
-                  >
-                    <TableIcon className="size-4" /> Table
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant={
-                      assignmentsView === "calendar" ? "default" : "ghost"
-                    }
-                    className="rounded-l-none"
-                    onClick={() => setAssignmentsView("calendar")}
-                  >
-                    <CalendarRange className="size-4" /> Calendar
-                  </Button>
-                </div>
-              </div>
-              {assignmentsView === "calendar" && (
-                <>
-                  <ScheduleCalendar
-                    assignments={assignments}
-                    defaultDate={
-                      assignments.length > 0
-                        ? new Date(assignments[0].event.startDateTime)
-                        : new Date(startDate)
-                    }
-                    onSelectAssignment={(a) => setDecliningAssignment(a)}
-                  />
-                  <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-                    <span className="flex items-center gap-1.5">
-                      <span className="inline-block size-3 rounded bg-[rgb(148,163,184)]" />
-                      Proposed
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      <span className="inline-block size-3 rounded bg-[rgb(22,163,74)]" />
-                      Synced to Outlook
-                    </span>
-                    <span className="flex items-center gap-1.5">
-                      <span className="inline-block size-3 rounded bg-[rgb(220,38,38)]" />
-                      Conflict
-                    </span>
-                    <span className="ml-auto">Click an event to decline / replace</span>
-                  </div>
-                </>
-              )}
-              {assignmentsView === "table" && grouped.length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No assignments were made in this range.
-                </p>
-              )}
-              {assignmentsView === "table" && grouped.map(([day, dayAssignments]) => (
-                <div key={day} className="border rounded-lg bg-card">
-                  <div className="px-4 py-2 border-b text-sm font-medium bg-muted/40">
-                    {day}
-                  </div>
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Event</TableHead>
-                        <TableHead>When</TableHead>
-                        <TableHead className="w-16">Tier</TableHead>
-                        <TableHead>Person</TableHead>
-                        <TableHead className="w-28">Status</TableHead>
-                        <TableHead className="w-16" />
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {dayAssignments.map((a) => (
-                        <TableRow key={a.id}>
-                          <TableCell className="font-medium">{a.event.title}</TableCell>
-                          <TableCell className="text-sm text-muted-foreground">
-                            {formatRange(a.event.startDateTime, a.event.endDateTime)}
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant="outline">T{a.event.priorityTier}</Badge>
-                          </TableCell>
-                          <TableCell>
-                            <Link
-                              to={`/people?edit=${a.person.id}`}
-                              className="hover:underline"
-                            >
-                              {a.person.name}
-                            </Link>
-                          </TableCell>
-                          <TableCell>{statusBadge(a.status)}</TableCell>
-                          <TableCell className="text-right space-x-0.5">
-                            {a.status === "confirmed" && (
-                              <Button
-                                size="icon"
-                                variant="ghost"
-                                onClick={() => setUnsyncingAssignment(a)}
-                                title="Unsync from Outlook (revert to proposed). Keeps the assignment, just removes the calendar event."
-                              >
-                                <CloudOff className="size-4" />
-                              </Button>
-                            )}
-                            <Button
-                              size="icon"
-                              variant="ghost"
-                              onClick={() => setDecliningAssignment(a)}
-                              title={
-                                a.status === "confirmed"
-                                  ? "Decline (removes Outlook event AND assignment) and optionally pick a replacement"
-                                  : "Decline and optionally pick a replacement"
-                              }
-                            >
-                              <UserX className="size-4" />
-                            </Button>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              ))}
-            </div>
-
-            <div className="flex flex-col gap-3 lg:w-auto">
-              {conflictsCollapsed ? (
-                <SectionChicklet
-                  icon={<AlertCircle className="size-5 text-destructive" />}
-                  label="Show Conflicts"
-                  count={conflicts.length}
-                  countTone="destructive"
-                  onClick={() => setConflictsCollapsed(false)}
-                />
-              ) : (
-                <div className="lg:w-72">
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-lg font-medium flex items-center gap-2">
-                      <AlertCircle className="size-4 text-destructive" />
-                      Conflicts
-                      {conflicts.length > 0 && (
-                        <Badge variant="destructive" className="ml-1">
-                          {conflicts.length}
-                        </Badge>
-                      )}
-                    </h2>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      onClick={() => setConflictsCollapsed(true)}
-                      aria-label="Collapse conflicts"
-                      title="Collapse to free up space"
-                    >
-                      <ChevronRight className="size-4" />
-                    </Button>
-                  </div>
-                  {conflicts.length === 0 ? (
-                    <p className="mt-2 text-sm text-muted-foreground flex items-center gap-2">
-                      <CheckCircle2 className="size-4 text-green-600" /> No conflicts.
-                    </p>
-                  ) : (
-                    <ul className="mt-2 space-y-2">
-                      {conflicts.map((c, i) => (
-                        <li
-                          key={`${c.event_id}-${i}`}
-                          className="border rounded-md p-3 bg-card text-sm"
-                        >
-                          <Link
-                            to={`/events?focus=${c.event_id}`}
-                            className="font-medium hover:underline"
-                          >
-                            {eventTitleById.get(c.event_id) ?? c.event_id}
-                          </Link>
-                          <div className="mt-1 flex items-center gap-2">
-                            <Badge variant="destructive">{REASON_LABEL[c.reason]}</Badge>
-                            <span className="text-muted-foreground">
-                              short {c.short_by}
-                            </span>
-                          </div>
-                          <div className="mt-1 text-muted-foreground text-xs">
-                            {c.message}
-                          </div>
-                          <div className="mt-2 flex gap-1.5">
-                            <Button
-                              size="sm"
-                              variant="default"
-                              onClick={() => setResolvingConflict(c)}
-                              title="See why this conflict exists and rearrange people across events to fix it"
-                            >
-                              <Wand2 className="size-3.5" />
-                              Resolve
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={() => setCancellingConflict(c)}
-                              title="Accept partial coverage (reduces requirement) or cancel the event if nobody is assigned"
-                            >
-                              <Ban className="size-3.5" />
-                              Cancel & archive
-                            </Button>
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-
-              {!conflictsCollapsed && !warningsCollapsed && <Separator />}
-
-              {warningsCollapsed ? (
-                <SectionChicklet
-                  icon={<AlertTriangle className="size-5 text-amber-500" />}
-                  label="Show Warnings"
-                  count={result.warnings.length}
-                  countTone="warn"
-                  onClick={() => setWarningsCollapsed(false)}
-                />
-              ) : (
-                <div className="lg:w-72">
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-lg font-medium flex items-center gap-2">
-                      <AlertTriangle className="size-4 text-amber-500" />
-                      Warnings
-                      {result.warnings.length > 0 && (
-                        <Badge
-                          variant="outline"
-                          className="ml-1 border-amber-500/40 text-amber-600"
-                        >
-                          {result.warnings.length}
-                        </Badge>
-                      )}
-                    </h2>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      onClick={() => setWarningsCollapsed(true)}
-                      aria-label="Collapse warnings"
-                      title="Collapse to free up space"
-                    >
-                      <ChevronRight className="size-4" />
-                    </Button>
-                  </div>
-                  {result.warnings.length === 0 ? (
-                    <p className="mt-2 text-sm text-muted-foreground">No warnings.</p>
-                  ) : (
-                    <ul className="mt-2 space-y-2">
-                      {result.warnings.map((w, i) => (
-                        <li
-                          key={i}
-                          className="border rounded-md p-3 bg-card text-sm"
-                        >
-                          <div className="font-medium">
-                            <Link
-                              to={`/people?edit=${w.person_id}`}
-                              className="hover:underline"
-                            >
-                              {w.person_name}
-                            </Link>
-                            <span className="text-muted-foreground font-normal ml-2">
-                              · {w.type.replace("_", " ")}
-                            </span>
-                          </div>
-                          <div className="text-muted-foreground text-xs mt-1">
-                            {w.message}
-                          </div>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </>
-      )}
 
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent>
@@ -880,11 +866,15 @@ export function SchedulePage() {
         conflict={resolvingConflict}
         eventTitle={
           resolvingConflict
-            ? eventTitleById.get(resolvingConflict.event_id)
+            ? eventsById.get(resolvingConflict.event_id)?.title
             : undefined
         }
         onClose={() => setResolvingConflict(null)}
         onResolved={onResolveResolved}
+        inputSnapshot={cached?.inputSnapshot}
+        snapshotGeneratedAt={cached?.generatedAt}
+        onAccept={onAcceptConflict}
+        onRemoveAssignment={onRemoveAssignment}
       />
 
       <CancelConflictDialog
@@ -900,7 +890,7 @@ export function SchedulePage() {
         }
         eventTitle={
           cancellingConflict
-            ? eventTitleById.get(cancellingConflict.event_id)
+            ? eventsById.get(cancellingConflict.event_id)?.title
             : undefined
         }
         currentAssignedCount={
@@ -924,39 +914,3 @@ export function SchedulePage() {
   );
 }
 
-function SectionChicklet({
-  icon,
-  label,
-  count,
-  countTone,
-  onClick,
-}: {
-  icon: ReactNode;
-  label: string;
-  count: number;
-  countTone: "destructive" | "warn";
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={`${label} (${count})`}
-      aria-label={`${label} (${count})`}
-      className="relative size-10 border rounded-md bg-card hover:bg-muted flex items-center justify-center self-end shrink-0"
-    >
-      {icon}
-      {count > 0 && (
-        <span
-          className={`absolute -top-1.5 -right-1.5 min-w-5 h-5 px-1 rounded-full text-[10px] font-semibold flex items-center justify-center border ${
-            countTone === "destructive"
-              ? "bg-destructive text-destructive-foreground border-destructive"
-              : "bg-amber-500 text-white border-amber-500"
-          }`}
-        >
-          {count}
-        </span>
-      )}
-    </button>
-  );
-}

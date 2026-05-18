@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Pencil, Trash2, Plus, Calendar } from "lucide-react";
+import { Pencil, Trash2, Plus, Calendar, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -35,6 +35,7 @@ import {
   useCreateEvent,
   useUpdateEvent,
   useDeleteEvent,
+  useRestoreEvent,
 } from "@/features/events/useEvents";
 import { EventForm, type EventFormValues } from "@/features/events/EventForm";
 import type { Event, CreateEventInput } from "@/lib/types";
@@ -78,10 +79,13 @@ const tierVariant: Record<number, "default" | "secondary" | "outline"> = {
 };
 
 export function EventsPage() {
-  const { data: events, isLoading, error } = useEvents();
+  // Include cancelled events so admins can audit / restore them — the
+  // Schedule and other consumers stick with the default (cancelled excluded).
+  const { data: events, isLoading, error } = useEvents({ includeCancelled: true });
   const createMutation = useCreateEvent();
   const updateMutation = useUpdateEvent();
   const deleteMutation = useDeleteEvent();
+  const restoreMutation = useRestoreEvent();
 
   const [createOpen, setCreateOpen] = useState(false);
   const [editing, setEditing] = useState<Event | null>(null);
@@ -124,6 +128,15 @@ export function EventsPage() {
       setEditing(null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to update");
+    }
+  };
+
+  const handleRestore = async (ev: Event) => {
+    try {
+      await restoreMutation.mutateAsync(ev.id);
+      toast.success(`Restored "${ev.title}" — eligible for scheduling again`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to restore");
     }
   };
 
@@ -205,10 +218,26 @@ export function EventsPage() {
                   ref={(el) => {
                     rowRefs.current.set(ev.id, el);
                   }}
+                  className={ev.cancelledAt ? "opacity-60" : undefined}
                 >
                   <TableCell className="font-medium">
-                    {ev.title}
-                    {ev.isHardRequirement && (
+                    <span className={ev.cancelledAt ? "line-through" : undefined}>
+                      {ev.title}
+                    </span>
+                    {ev.cancelledAt && (
+                      <Badge
+                        variant="outline"
+                        className="ml-2 border-amber-500/40 text-amber-600"
+                        title={
+                          ev.cancellationReason
+                            ? `Cancelled: ${ev.cancellationReason}`
+                            : "Cancelled — excluded from scheduling"
+                        }
+                      >
+                        Cancelled
+                      </Badge>
+                    )}
+                    {ev.isHardRequirement && !ev.cancelledAt && (
                       <Badge variant="outline" className="ml-2">hard</Badge>
                     )}
                     {ev.location && (
@@ -234,10 +263,34 @@ export function EventsPage() {
                     </div>
                   </TableCell>
                   <TableCell className="text-right space-x-1">
-                    <Button size="icon" variant="ghost" onClick={() => setEditing(ev)}>
+                    {ev.cancelledAt && (
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => handleRestore(ev)}
+                        disabled={restoreMutation.isPending}
+                        title="Restore — makes this event eligible for scheduling again"
+                        aria-label={`Restore ${ev.title}`}
+                      >
+                        <RotateCcw className="size-4" />
+                      </Button>
+                    )}
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setEditing(ev)}
+                      title="Edit"
+                      aria-label={`Edit ${ev.title}`}
+                    >
                       <Pencil className="size-4" />
                     </Button>
-                    <Button size="icon" variant="ghost" onClick={() => setDeleting(ev)}>
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      onClick={() => setDeleting(ev)}
+                      title="Delete permanently"
+                      aria-label={`Delete ${ev.title}`}
+                    >
                       <Trash2 className="size-4" />
                     </Button>
                   </TableCell>

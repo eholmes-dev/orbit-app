@@ -10,6 +10,8 @@ import {
   Loader2,
   Mail,
   Clock,
+  Check,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -28,12 +30,25 @@ import {
   useMoveAssignment,
   useRequestOverride,
   type Candidate,
+  type EventFullyStaffedBody,
 } from "@/features/schedule/useSchedule";
+import { ApiError } from "@/lib/api";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import type {
   ScheduleAssignment,
   ScheduleConflict,
   ConflictReason,
+  SolverInputSnapshot,
 } from "@/lib/types";
+import { SolverDiagnosticSection } from "./SolverDiagnosticSection";
 
 const REASON_LABEL: Record<ConflictReason, string> = {
   no_qualified_staff: "Not enough qualified staff",
@@ -54,6 +69,20 @@ interface Props {
    * time without re-running the solver.
    */
   onResolved: (updatedAssignments: ScheduleAssignment[]) => void;
+  /** Cached snapshot of what the last Generate sent to the solver — drives
+   *  the "Solver diagnostic" panel so admins can see which gate excluded
+   *  each person at solve time. May be undefined for older cached views. */
+  inputSnapshot?: SolverInputSnapshot;
+  /** ISO timestamp of when the snapshot was captured. */
+  snapshotGeneratedAt?: string;
+  /** Optional — when provided, shows an "Accept as partial" footer action
+   *  that lowers the event's requiredStaffCount to the current assigned
+   *  headcount via the same flow as the ConflictsPanel button. */
+  onAccept?: (conflict: ScheduleConflict) => Promise<void> | void;
+  /** Optional — when provided, shows a Remove (X) action next to each
+   *  currently-assigned proposed person. Soft-deletes the assignment with no
+   *  decline trail; the solver can re-suggest the same person next Generate. */
+  onRemoveAssignment?: (assignment: ScheduleAssignment) => Promise<void> | void;
 }
 
 function formatTime(iso: string): string {
@@ -232,6 +261,10 @@ export function ResolveConflictDialog({
   eventTitle,
   onClose,
   onResolved,
+  inputSnapshot,
+  snapshotGeneratedAt,
+  onAccept,
+  onRemoveAssignment,
 }: Props) {
   const open = !!conflict;
   const eventId = conflict?.event_id ?? null;
@@ -246,12 +279,22 @@ export function ResolveConflictDialog({
     [data],
   );
   const required =
-    data?.event.requiredStaffCount ??
+    data?.event?.requiredStaffCount ??
     (conflict ? conflict.short_by : 0);
+  const candidates = data?.candidates ?? [];
 
   // State for the Close-vs-Done button label. Actual change-tracking happens
   // in the polling effect below (single source of truth for parent updates).
   const [mutated, setMutated] = useState(false);
+
+  // Replace-confirmation prompt — opens when an Add/Reassign hits the
+  // backend's capacity guard. Admin picks which currently-assigned person to
+  // swap out, then we retry the assign with `replacePersonId`.
+  const [replacePrompt, setReplacePrompt] = useState<{
+    personId: string;
+    personName: string;
+    currentAssignments: EventFullyStaffedBody["currentAssignments"];
+  } | null>(null);
 
   // Snapshot pending-request state across polls so we can fire a toast when a
   // recipient responds to an override request without admin action.
@@ -311,15 +354,33 @@ export function ResolveConflictDialog({
     previousAssignmentIdsRef.current = currentIds;
   }, [data, onResolved]);
 
-  const handleAdd = async (personId: string) => {
+  const handleAdd = async (personId: string, replacePersonId?: string) => {
     if (!eventId) return;
     try {
-      await assign.mutateAsync({ eventId, personId });
-      toast.success("Added");
+      await assign.mutateAsync({ eventId, personId, replacePersonId });
+      toast.success(replacePersonId ? "Replaced" : "Added");
       // Wait for the refresh so the change-detection effect fires before
       // we yield to the user.
       await refetch();
+      setReplacePrompt(null);
     } catch (err) {
+      // Capacity guard: the event is already fully staffed. Surface the
+      // "pick someone to replace?" prompt so admin can confirm a swap.
+      if (
+        err instanceof ApiError &&
+        err.status === 409 &&
+        (err.body as EventFullyStaffedBody | undefined)?.code ===
+          "EVENT_FULLY_STAFFED"
+      ) {
+        const body = err.body as EventFullyStaffedBody;
+        const candidate = candidates.find((c) => c.person.id === personId);
+        setReplacePrompt({
+          personId,
+          personName: candidate?.person.name ?? "this person",
+          currentAssignments: body.currentAssignments,
+        });
+        return;
+      }
       toast.error(err instanceof Error ? err.message : "Add failed");
     }
   };
@@ -371,24 +432,45 @@ export function ResolveConflictDialog({
     onClose();
   };
 
-  const candidates = data?.candidates ?? [];
+  // Fully-staffed events open this dialog as a "view details" surface rather
+  // than a "resolve a conflict" surface. The header, body diagnostic, and
+  // footer Accept-partial action all adapt. Browsing/swapping people is still
+  // available via the candidate list.
+  const isFilled =
+    required > 0 && currentAssignments.length >= required;
 
   return (
     <Dialog open={open} onOpenChange={(o) => !o && handleClose()}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Wand2 className="size-5 text-primary" />
-            Resolve "{eventTitle ?? "event"}"
-          </DialogTitle>
-          <DialogDescription>
-            {conflict && (
-              <>
-                {currentAssignments.length} of {required} assigned · short by{" "}
-                {conflict.short_by} · {REASON_LABEL[conflict.reason]}
-              </>
-            )}
-          </DialogDescription>
+          {isFilled ? (
+            <>
+              <DialogTitle className="flex items-center gap-2">
+                <CheckCircle2 className="size-5 text-green-600" />
+                {eventTitle ?? "Event"}
+              </DialogTitle>
+              <DialogDescription>
+                Fully staffed · {currentAssignments.length} of {required}{" "}
+                assigned. Currently <strong>proposed</strong> — publish to push
+                to Outlook.
+              </DialogDescription>
+            </>
+          ) : (
+            <>
+              <DialogTitle className="flex items-center gap-2">
+                <Wand2 className="size-5 text-primary" />
+                Resolve "{eventTitle ?? "event"}"
+              </DialogTitle>
+              <DialogDescription>
+                {conflict && (
+                  <>
+                    {currentAssignments.length} of {required} assigned · short
+                    by {conflict.short_by} · {REASON_LABEL[conflict.reason]}
+                  </>
+                )}
+              </DialogDescription>
+            </>
+          )}
         </DialogHeader>
 
         <div className="space-y-4">
@@ -403,17 +485,40 @@ export function ResolveConflictDialog({
                 {currentAssignments.map((a) => (
                   <li
                     key={a.id}
-                    className="text-sm flex items-center justify-between border rounded-md px-3 py-2 bg-muted/30"
+                    className="text-sm flex items-center justify-between gap-2 border rounded-md px-3 py-2 bg-muted/30"
                   >
-                    <span>{a.person.name}</span>
-                    <Badge variant={a.status === "confirmed" ? "default" : "secondary"}>
-                      {a.status}
-                    </Badge>
+                    <span className="truncate flex-1">{a.person.name}</span>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <Badge variant={a.status === "confirmed" ? "default" : "secondary"}>
+                        {a.status}
+                      </Badge>
+                      {a.status === "proposed" && onRemoveAssignment && (
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          onClick={() => onRemoveAssignment(a)}
+                          disabled={busy}
+                          title="Remove this proposed assignment. No decline trail — solver can re-suggest the same person next Generate."
+                          aria-label={`Remove ${a.person.name}`}
+                          className="size-7"
+                        >
+                          <X className="size-4" />
+                        </Button>
+                      )}
+                    </div>
                   </li>
                 ))}
               </ul>
             )}
           </section>
+
+          {eventId && !isFilled && (
+            <SolverDiagnosticSection
+              eventId={eventId}
+              snapshot={inputSnapshot}
+              generatedAt={snapshotGeneratedAt}
+            />
+          )}
 
           <section>
             <h3 className="text-sm font-medium mb-2">
@@ -456,12 +561,77 @@ export function ResolveConflictDialog({
           </section>
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="sm:justify-between">
+          {/* Accept-partial is only meaningful when the event is partially
+              filled — at least 1 assigned, but still under required. */}
+          {onAccept &&
+          conflict &&
+          currentAssignments.length > 0 &&
+          currentAssignments.length < required ? (
+            <Button
+              variant="outline"
+              onClick={async () => {
+                await onAccept(conflict);
+                handleClose();
+              }}
+              disabled={busy}
+              title={`Reduce this event's staffing requirement from ${required} to ${currentAssignments.length} so it stops being flagged.`}
+            >
+              <Check className="size-4" /> Accept as partial (
+              {currentAssignments.length}/{required})
+            </Button>
+          ) : (
+            <span />
+          )}
           <Button variant="outline" onClick={handleClose} disabled={busy}>
             {mutated ? "Done" : "Close"}
           </Button>
         </DialogFooter>
       </DialogContent>
+
+      <AlertDialog
+        open={!!replacePrompt}
+        onOpenChange={(open) => !open && setReplacePrompt(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Event is already fully staffed</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>
+                  Adding <strong>{replacePrompt?.personName}</strong> would
+                  exceed this event's staffing requirement. Pick someone to
+                  replace, or cancel.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {replacePrompt && (
+            <div className="space-y-1.5">
+              {replacePrompt.currentAssignments.map((a) => (
+                <button
+                  key={a.assignmentId}
+                  type="button"
+                  onClick={() =>
+                    handleAdd(replacePrompt.personId, a.personId)
+                  }
+                  disabled={busy}
+                  className="w-full flex items-center justify-between gap-2 rounded-md border bg-card px-3 py-2 text-sm text-left hover:bg-muted disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  <span>
+                    Replace{" "}
+                    <span className="font-medium">{a.personName}</span>
+                  </span>
+                  <RotateCcw className="size-4 text-muted-foreground" />
+                </button>
+              ))}
+            </div>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Dialog>
   );
 }

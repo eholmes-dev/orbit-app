@@ -303,10 +303,15 @@ def solve(request: SolveRequest) -> SolveResponse:
 
 
 def _conflict_message(event: EventInput, reason: ConflictReason, short_by: int) -> str:
+    # Note: `event` is intentionally unused — the message used to lead with
+    # event.id, but that surfaced raw cuids in the UI. Title + time are now
+    # rendered in the conflict card from the backend's event hydration; this
+    # message is just the human-readable reason sentence.
+    del event
     reason_human = {
         "no_qualified_staff": "no person has all required labels",
         "no_availability": "all qualified people are blocked or on PTO",
         "capacity_exhausted": "all qualified+available people are over capacity",
         "over_constrained": "no feasible assignment within constraints",
     }[reason]
-    return f'"{event.id}" is short by {short_by} — {reason_human}.'
+    return f"Short by {short_by} — {reason_human}."

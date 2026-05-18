@@ -22,6 +22,10 @@ const assignmentIncludeForResponse = {
       startDateTime: true,
       endDateTime: true,
       priorityTier: true,
+      // First required label is used by the Schedule grid to color the shift
+      // card (closest analog to "role"). Include all required labels in case
+      // we surface more than one later.
+      requiredLabels: { select: { id: true, name: true } },
     },
   },
   person: { select: { id: true, name: true, email: true } },
@@ -68,10 +72,7 @@ scheduleRouter.get(
               }
             : undefined,
       },
-      include: {
-        event: { select: { id: true, title: true, startDateTime: true, endDateTime: true, priorityTier: true } },
-        person: { select: { id: true, name: true, email: true } },
-      },
+      include: assignmentIncludeForResponse,
       orderBy: { event: { startDateTime: "asc" } },
     });
     res.json(assignments);
@@ -206,6 +207,36 @@ scheduleRouter.post(
       person_name: personNameById.get(w.person_id) ?? w.person_id,
     }));
 
+    // Snapshot of what the solver was actually given. The frontend caches
+    // this so admins can run a "why wasn't X scheduled?" diagnostic against
+    // the exact inputs the solver saw, without needing the backend to re-fetch.
+    const inputSnapshot = {
+      people: people.map((p) => ({
+        id: p.id,
+        name: p.name,
+        label_ids: p.labels.map((l) => l.id),
+        max_hours_per_week: p.maxHoursPerWeek,
+      })),
+      events: events.map((e) => ({
+        id: e.id,
+        title: e.title,
+        start: e.startDateTime.toISOString(),
+        end: e.endDateTime.toISOString(),
+        required_label_ids: e.requiredLabels.map((l) => l.id),
+        required_staff_count: e.requiredStaffCount,
+      })),
+      availability: availability.map((a) => ({
+        person_id: a.personId,
+        start: a.startDateTime.toISOString(),
+        end: a.endDateTime.toISOString(),
+        type: a.type,
+      })),
+      declined_pairs: declined.map((d) => ({
+        event_id: d.eventId,
+        person_id: d.personId,
+      })),
+    };
+
     res.json({
       status: solverResult.status,
       solveTimeMs: solverResult.solve_time_ms,
@@ -216,6 +247,7 @@ scheduleRouter.post(
         conflicts: solverResult.conflicts.length,
         warnings: solverResult.warnings.length,
       },
+      inputSnapshot,
       assignments: hydrated,
       conflicts: solverResult.conflicts,
       warnings: hydratedWarnings,
@@ -248,23 +280,55 @@ scheduleRouter.post(
 
     for (const a of proposed) {
       try {
-        const bodyText =
-          `Tier ${a.event.priorityTier} shift.\n` +
-          `Assigned to ${a.person.name} by Orbit Scheduler.`;
-        const externalEventId = await createCalendarEvent(a.person.email, {
-          subject: a.event.title,
-          start: a.event.startDateTime,
-          end: a.event.endDateTime,
-          bodyText,
-        });
-        await prisma.assignment.update({
-          where: { id: a.id },
+        // Idempotency (audit #6): if a previous attempt already created the
+        // Outlook event but failed to flip the DB row to confirmed (or admin
+        // is retrying), reuse the existing externalEventId rather than
+        // creating a duplicate Outlook event.
+        let externalEventId = a.externalEventId;
+        if (!externalEventId) {
+          const bodyText =
+            `Tier ${a.event.priorityTier} shift.\n` +
+            `Assigned to ${a.person.name} by Orbit Scheduler.`;
+          externalEventId = await createCalendarEvent(a.person.email, {
+            subject: a.event.title,
+            start: a.event.startDateTime,
+            end: a.event.endDateTime,
+            bodyText,
+          });
+          // Persist externalEventId immediately so a retry recovers cleanly
+          // even if the status flip below loses a race. Only touches the row
+          // if it's still proposed — a concurrent decline already cleared it.
+          await prisma.assignment.updateMany({
+            where: { id: a.id, status: "proposed" },
+            data: { externalEventId },
+          });
+        }
+
+        // Atomic status flip (audit #3): only confirm if the row is still
+        // proposed. If a concurrent Decline / Remove moved it elsewhere, we
+        // lost the race and need to clean up the Outlook event we created.
+        const updated = await prisma.assignment.updateMany({
+          where: { id: a.id, status: "proposed" },
           data: {
             status: "confirmed",
             externalEventId,
             syncedToOutlookAt: new Date(),
           },
         });
+        if (updated.count === 0) {
+          try {
+            await deleteCalendarEvent(a.person.email, externalEventId);
+          } catch {
+            // Best-effort. Orphan logged in the failed result below.
+          }
+          results.push({
+            assignmentId: a.id,
+            status: "failed",
+            error:
+              "Assignment was changed (declined or removed) during sync; Outlook event rolled back.",
+          });
+          continue;
+        }
         results.push({ assignmentId: a.id, status: "confirmed" });
       } catch (err) {
         results.push({
@@ -318,6 +382,33 @@ scheduleRouter.post(
     }> = [];
 
     for (const a of confirmed) {
+      // Atomic flip first (audit #3): only unconfirm if the row is still
+      // confirmed AND still has the externalEventId we read. A concurrent
+      // /confirm wouldn't change a confirmed row, but a concurrent /decline
+      // could have already cleared everything — in which case our cleanup
+      // would target a stale id. updateMany returns count=0 if the row was
+      // changed under us, so we know to skip the Outlook delete.
+      const flipped = await prisma.assignment.updateMany({
+        where: {
+          id: a.id,
+          status: "confirmed",
+          externalEventId: a.externalEventId,
+        },
+        data: {
+          status: "proposed",
+          externalEventId: null,
+          syncedToOutlookAt: null,
+        },
+      });
+      if (flipped.count === 0) {
+        results.push({
+          assignmentId: a.id,
+          status: "failed",
+          error:
+            "Assignment was changed by another request (already unsynced or declined). Refresh and try again.",
+        });
+        continue;
+      }
       if (a.externalEventId) {
         try {
           await deleteCalendarEvent(a.person.email, a.externalEventId);
@@ -325,19 +416,11 @@ scheduleRouter.post(
           results.push({
             assignmentId: a.id,
             status: "failed",
-            error: err instanceof Error ? err.message : String(err),
+            error: `Row reverted to proposed but Outlook event couldn't be deleted: ${err instanceof Error ? err.message : String(err)}. Delete it manually.`,
           });
           continue;
         }
       }
-      await prisma.assignment.update({
-        where: { id: a.id },
-        data: {
-          status: "proposed",
-          externalEventId: null,
-          syncedToOutlookAt: null,
-        },
-      });
       results.push({ assignmentId: a.id, status: "unconfirmed" });
     }
 
@@ -395,80 +478,111 @@ scheduleRouter.post(
   asyncHandler(async (req, res) => {
     const { replacementPersonId } = declineSchema.parse(req.body);
 
-    const a = await prisma.assignment.findUniqueOrThrow({
-      where: { id: req.params.id },
-      include: {
-        event: { select: { id: true } },
-        person: { select: { id: true, email: true } },
-      },
+    // Capture externalEventId atomically with the status flip — without this,
+    // a concurrent Confirm could set a fresh externalEventId between our read
+    // and write, and the cleanup below would silently miss it. (audit #3)
+    const {
+      alreadyDeclined,
+      externalEventIdToCleanup,
+      personEmail,
+      eventId,
+      personId,
+    } = await prisma.$transaction(async (tx) => {
+      const current = await tx.assignment.findUniqueOrThrow({
+        where: { id: req.params.id },
+        include: {
+          event: { select: { id: true } },
+          person: { select: { id: true, email: true } },
+        },
+      });
+      const wasDeclined = current.status === "declined";
+      const ext = current.externalEventId;
+      if (!wasDeclined) {
+        await tx.assignment.update({
+          where: { id: current.id },
+          data: {
+            status: "declined",
+            externalEventId: null,
+            syncedToOutlookAt: null,
+          },
+        });
+        await tx.archiveEntry.create({
+          data: {
+            kind: "declined_assignment",
+            eventId: current.event.id,
+            personId: current.person.id,
+          },
+        });
+      }
+      return {
+        alreadyDeclined: wasDeclined,
+        // Always honor an externalEventId — it may have been set by a
+        // concurrent Confirm even if status was still "proposed" when we read.
+        externalEventIdToCleanup: ext,
+        personEmail: current.person.email,
+        eventId: current.event.id,
+        personId: current.person.id,
+      };
     });
+    void alreadyDeclined;
+    void personId;
 
-    const alreadyDeclined = a.status === "declined";
-
-    // If this assignment had been pushed to Outlook, remove the calendar event
-    // first. (Won't fire on already-declined rows since externalEventId is
-    // cleared at decline time.)
-    if (a.status === "confirmed" && a.externalEventId) {
+    // Outlook cleanup happens AFTER the DB transaction. If it fails, the row
+    // is already declined in Orbit — surface the orphan to the admin so they
+    // can clean up manually rather than silently leaving Outlook out of sync.
+    if (externalEventIdToCleanup) {
       try {
-        await deleteCalendarEvent(a.person.email, a.externalEventId);
+        await deleteCalendarEvent(personEmail, externalEventIdToCleanup);
       } catch (err) {
         throw new HttpError(
           502,
-          `Failed to remove Outlook event: ${err instanceof Error ? err.message : err}`,
+          `Decline succeeded in Orbit but the Outlook event couldn't be removed: ${err instanceof Error ? err.message : err}. Delete it from the user's calendar manually.`,
         );
       }
     }
 
-    // Idempotent: flipping an already-declined row is a no-op for the status
-    // but we still want the rest of the handler (replacement creation,
-    // response) to run.
-    if (!alreadyDeclined) {
-      await prisma.assignment.update({
-        where: { id: a.id },
-        data: {
-          status: "declined",
-          externalEventId: null,
-          syncedToOutlookAt: null,
-        },
-      });
-      // Audit log entry — only on the actual flip, not on idempotent re-calls.
-      await prisma.archiveEntry.create({
-        data: {
-          kind: "declined_assignment",
-          eventId: a.event.id,
-          personId: a.person.id,
-        },
-      });
-    }
-
     // If admin picked a replacement, create a new proposed assignment now.
     // Stays as proposed even when the original was confirmed — admin reviews
-    // and re-syncs.
+    // and re-syncs. When the replacement was previously declined for this
+    // event, the admin's manual pick overrides that — we un-decline rather
+    // than reject. Solver's hard "declined_pairs" constraint still respects
+    // *current* declined rows on the next auto-generate.
     if (replacementPersonId) {
-      try {
+      const existingRow = await prisma.assignment.findUnique({
+        where: {
+          eventId_personId: {
+            eventId,
+            personId: replacementPersonId,
+          },
+        },
+      });
+      if (existingRow && existingRow.status === "declined") {
+        await prisma.assignment.update({
+          where: { id: existingRow.id },
+          data: {
+            status: "proposed",
+            externalEventId: null,
+            syncedToOutlookAt: null,
+          },
+        });
+      } else if (existingRow) {
+        throw new HttpError(
+          409,
+          "That person is already assigned to this event.",
+        );
+      } else {
         await prisma.assignment.create({
           data: {
-            eventId: a.event.id,
+            eventId,
             personId: replacementPersonId,
             status: "proposed",
           },
         });
-      } catch (err) {
-        // (eventId, personId) uniqueness — replacement was already assigned
-        // or declined for this event in the past.
-        const code = (err as { code?: string }).code;
-        if (code === "P2002") {
-          throw new HttpError(
-            409,
-            "That person already has an assignment (or decline) for this event.",
-          );
-        }
-        throw err;
       }
     }
 
     const updated = await prisma.assignment.findMany({
-      where: { eventId: a.event.id, status: { not: "declined" } },
+      where: { eventId, status: { not: "declined" } },
       include: assignmentIncludeForResponse,
       orderBy: { event: { startDateTime: "asc" } },
     });
@@ -508,7 +622,38 @@ scheduleRouter.get(
       return requiredLabelIds.every((rid) => owned.has(rid));
     });
     if (qualified.length === 0) {
-      res.json({ candidates: [] });
+      // Still emit the full response shape — the dialog reads `event` and
+      // `currentAssignments` for header/footer rendering and crashes if they
+      // are missing. Surfaces "no qualified people" as an empty candidate list
+      // rather than a broken page.
+      const currentAssignmentsHere = await prisma.assignment.findMany({
+        where: { eventId: event.id, status: { not: "declined" } },
+        include: {
+          event: {
+            select: {
+              id: true,
+              title: true,
+              startDateTime: true,
+              endDateTime: true,
+              priorityTier: true,
+              requiredLabels: { select: { id: true, name: true } },
+            },
+          },
+          person: { select: { id: true, name: true, email: true } },
+        },
+        orderBy: { event: { startDateTime: "asc" } },
+      });
+      res.json({
+        event: {
+          id: event.id,
+          title: event.title,
+          startDateTime: event.startDateTime,
+          endDateTime: event.endDateTime,
+          requiredStaffCount: event.requiredStaffCount,
+        },
+        currentAssignments: currentAssignmentsHere,
+        candidates: [],
+      });
       return;
     }
 
@@ -679,18 +824,54 @@ scheduleRouter.post(
   "/conflicts/accept",
   asyncHandler(async (req, res) => {
     const { eventId, conflictReason, conflictShortBy } = conflictRefSchema.parse(req.body);
-    // Verify the event exists (404 if not).
-    await prisma.event.findUniqueOrThrow({ where: { id: eventId } });
+    const event = await prisma.event.findUniqueOrThrow({ where: { id: eventId } });
 
-    const entry = await prisma.archiveEntry.create({
-      data: {
-        kind: "accepted_conflict",
-        eventId,
-        conflictReason,
-        conflictShortBy,
-      },
+    // "Accept as partial" commits to the currently-staffed headcount as the
+    // event's new normal: drop the requirement to match. Future Generates
+    // won't flag this event as understaffed anymore. Audit-only acknowledge
+    // (without changing the requirement) is no longer offered — admins who
+    // want the higher staffing target should use Resolve to fill the gap.
+    const currentAssignedCount = await prisma.assignment.count({
+      where: { eventId, status: { not: "declined" } },
     });
-    res.status(201).json({ archiveEntryId: entry.id });
+    if (currentAssignedCount < 1) {
+      throw new HttpError(
+        409,
+        "Cannot accept partial coverage with zero assignments — assign at least one person first, or Cancel the event.",
+      );
+    }
+    if (currentAssignedCount >= event.requiredStaffCount) {
+      throw new HttpError(
+        409,
+        "Event is already fully staffed; nothing to accept.",
+      );
+    }
+
+    const previousRequiredStaffCount = event.requiredStaffCount;
+    const newRequiredStaffCount = currentAssignedCount;
+
+    const [, entry] = await prisma.$transaction([
+      prisma.event.update({
+        where: { id: eventId },
+        data: { requiredStaffCount: newRequiredStaffCount },
+      }),
+      prisma.archiveEntry.create({
+        data: {
+          kind: "accepted_conflict",
+          eventId,
+          conflictReason,
+          conflictShortBy,
+          previousRequiredStaffCount,
+          newRequiredStaffCount,
+        },
+      }),
+    ]);
+
+    res.status(201).json({
+      archiveEntryId: entry.id,
+      previousRequiredStaffCount,
+      newRequiredStaffCount,
+    });
   }),
 );
 
@@ -773,12 +954,18 @@ scheduleRouter.post(
   }),
 );
 
-const assignSchema = z.object({ personId: z.string().min(1) });
+const assignSchema = z.object({
+  personId: z.string().min(1),
+  /** Optional — when set, atomically removes this person's existing
+   *  (non-declined) assignment for the event before assigning `personId`.
+   *  Used by the "Event is fully staffed → replace someone?" confirm flow. */
+  replacePersonId: z.string().min(1).optional(),
+});
 
 scheduleRouter.post(
   "/events/:eventId/assign",
   asyncHandler(async (req, res) => {
-    const { personId } = assignSchema.parse(req.body);
+    const { personId, replacePersonId } = assignSchema.parse(req.body);
     const eventId = req.params.eventId;
 
     const [event, person, existing] = await Promise.all([
@@ -809,10 +996,66 @@ scheduleRouter.post(
       );
     }
 
-    if (existing) {
-      if (existing.status === "declined") {
-        // Un-decline → propose. The original decline is reversed by admin intent.
-        await prisma.assignment.update({
+    if (existing && existing.status !== "declined") {
+      throw new HttpError(
+        409,
+        `${person.name} is already assigned to this event.`,
+      );
+    }
+
+    // Capacity guard — without it, "Add" / "Reassign" silently over-staffs an
+    // already-full event. The frontend recognizes `code: EVENT_FULLY_STAFFED`
+    // and prompts the admin to pick someone to replace, then retries with
+    // `replacePersonId` set.
+    const currentRoster = await prisma.assignment.findMany({
+      where: { eventId, status: { not: "declined" } },
+      include: { person: { select: { id: true, name: true } } },
+    });
+    // The new assignment would add 1 to the roster (unless replacePersonId
+    // removes one first).
+    const rosterAfterReplace = replacePersonId
+      ? currentRoster.filter((a) => a.personId !== replacePersonId)
+      : currentRoster;
+    if (rosterAfterReplace.length >= event.requiredStaffCount) {
+      res.status(409).json({
+        error: "EventFullyStaffed",
+        code: "EVENT_FULLY_STAFFED",
+        message: `Event already has ${currentRoster.length} of ${event.requiredStaffCount} assigned. Pick someone to replace, or use Cancel & archive to reduce the requirement.`,
+        currentAssignments: currentRoster.map((a) => ({
+          assignmentId: a.id,
+          personId: a.personId,
+          personName: a.person.name,
+          status: a.status,
+        })),
+      });
+      return;
+    }
+
+    // Validate the replace target — must currently hold a non-declined
+    // assignment on this event.
+    if (replacePersonId) {
+      const target = currentRoster.find((a) => a.personId === replacePersonId);
+      if (!target) {
+        throw new HttpError(
+          409,
+          "The person being replaced is not currently assigned to this event.",
+        );
+      }
+    }
+
+    // Atomic: remove the displaced person (if any) AND propose the new one.
+    // Delete (rather than decline) so the solver can suggest them again later;
+    // admin's intent here is "swap them out", not "they refused".
+    await prisma.$transaction(async (tx) => {
+      if (replacePersonId) {
+        await tx.assignment.delete({
+          where: {
+            eventId_personId: { eventId, personId: replacePersonId },
+          },
+        });
+      }
+      if (existing && existing.status === "declined") {
+        await tx.assignment.update({
           where: { id: existing.id },
           data: {
             status: "proposed",
@@ -820,17 +1063,12 @@ scheduleRouter.post(
             syncedToOutlookAt: null,
           },
         });
-      } else {
-        throw new HttpError(
-          409,
-          `${person.name} is already assigned to this event.`,
-        );
+      } else if (!existing) {
+        await tx.assignment.create({
+          data: { eventId, personId, status: "proposed" },
+        });
       }
-    } else {
-      await prisma.assignment.create({
-        data: { eventId, personId, status: "proposed" },
-      });
-    }
+    });
 
     const updated = await prisma.assignment.findMany({
       where: { eventId, status: { not: "declined" } },
@@ -905,64 +1143,81 @@ scheduleRouter.post(
       );
     }
 
-    // Clean up source Outlook event if it was confirmed.
-    if (
-      fromAssignment.status === "confirmed" &&
-      fromAssignment.externalEventId
-    ) {
-      try {
-        await deleteCalendarEvent(
-          fromAssignment.person.email,
-          fromAssignment.externalEventId,
-        );
-      } catch (err) {
-        throw new HttpError(
-          502,
-          `Failed to remove source Outlook event: ${err instanceof Error ? err.message : err}. Move aborted.`,
-        );
-      }
-    }
-
     const fromEventId = fromAssignment.eventId;
 
-    await prisma.$transaction(async (tx) => {
-      // Decline the source assignment.
-      await tx.assignment.update({
-        where: { id: fromAssignment.id },
-        data: {
-          status: "declined",
-          externalEventId: null,
-          syncedToOutlookAt: null,
-        },
-      });
-      await tx.archiveEntry.create({
-        data: {
-          kind: "declined_assignment",
-          eventId: fromEventId,
-          personId: fromAssignment.person.id,
-          reason: `Moved to event ${toEventId}`,
-        },
-      });
-      // Create or un-decline on the target.
-      if (existingOnTarget && existingOnTarget.status === "declined") {
-        await tx.assignment.update({
-          where: { id: existingOnTarget.id },
+    // Re-fetch the source's externalEventId atomically with the status flip
+    // (audit #3) — a concurrent /confirm could have set a fresh
+    // externalEventId between our initial read and now, and the cleanup
+    // below must target the current value, not the stale one.
+    const { externalEventIdToCleanup } = await prisma.$transaction(
+      async (tx) => {
+        const fresh = await tx.assignment.findUniqueOrThrow({
+          where: { id: fromAssignment.id },
+        });
+        // Conditional flip — only proceed if still not declined.
+        const flipped = await tx.assignment.updateMany({
+          where: { id: fresh.id, status: { not: "declined" } },
           data: {
-            status: "proposed",
+            status: "declined",
             externalEventId: null,
             syncedToOutlookAt: null,
           },
         });
-      } else {
-        await tx.assignment.create({
+        if (flipped.count === 0) {
+          throw new HttpError(
+            409,
+            "Source assignment was changed by another request mid-flight. Refresh and retry.",
+          );
+        }
+        await tx.archiveEntry.create({
           data: {
-            eventId: toEventId,
+            kind: "declined_assignment",
+            eventId: fromEventId,
             personId: fromAssignment.person.id,
-            status: "proposed",
+            // Capture the target event's title at write-time so the archive
+            // stays readable even if the target is later renamed or cancelled.
+            reason: `Moved to "${toEvent.title}"`,
           },
         });
+        // Create or un-decline on the target.
+        if (existingOnTarget && existingOnTarget.status === "declined") {
+          await tx.assignment.update({
+            where: { id: existingOnTarget.id },
+            data: {
+              status: "proposed",
+              externalEventId: null,
+              syncedToOutlookAt: null,
+            },
+          });
+        } else {
+          await tx.assignment.create({
+            data: {
+              eventId: toEventId,
+              personId: fromAssignment.person.id,
+              status: "proposed",
+            },
+          });
+        }
+        return { externalEventIdToCleanup: fresh.externalEventId };
+      },
+    );
+
+    // Outlook cleanup after the transaction. Orbit state is already correct;
+    // an Outlook failure leaves an orphan event but doesn't roll back the
+    // move (the user wanted the move and we honored it).
+    if (externalEventIdToCleanup) {
+      try {
+        await deleteCalendarEvent(
+          fromAssignment.person.email,
+          externalEventIdToCleanup,
+        );
+      } catch (err) {
+        throw new HttpError(
+          502,
+          `Move succeeded in Orbit but the source Outlook event couldn't be removed: ${err instanceof Error ? err.message : err}. Delete it from the user's calendar manually.`,
+        );
       }
-    });
+    }
 
     const updated = await prisma.assignment.findMany({
       where: {

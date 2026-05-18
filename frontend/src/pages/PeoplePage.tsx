@@ -122,13 +122,23 @@ export function PeoplePage() {
   const handleDeactivate = async () => {
     if (!removing) return;
     try {
-      await updateMutation.mutateAsync({
+      const res = await updateMutation.mutateAsync({
         id: removing.id,
         input: { active: false },
       });
-      toast.success(`Deactivated ${removing.name}`, {
-        description: "Past schedules preserved. Hidden from future scheduling.",
-      });
+      const summary = res._deactivation;
+      let description = "Past schedules preserved. Hidden from future scheduling.";
+      if (summary && summary.declined > 0) {
+        description = `${summary.declined} future shift${summary.declined === 1 ? "" : "s"} cleared (now in Conflicts to backfill). Past schedules preserved.`;
+      }
+      if (summary && summary.outlookCleanupFailures.length > 0) {
+        toast.warning(`Deactivated ${removing.name}`, {
+          description: `${description} ${summary.outlookCleanupFailures.length} Outlook event${summary.outlookCleanupFailures.length === 1 ? "" : "s"} couldn't be cleaned up — delete manually.`,
+          duration: 15_000,
+        });
+      } else {
+        toast.success(`Deactivated ${removing.name}`, { description });
+      }
       setRemoving(null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to deactivate");

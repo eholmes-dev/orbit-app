@@ -4,6 +4,17 @@ import type { Person, CreatePersonInput } from "@/lib/types";
 
 const KEY = ["people"] as const;
 
+/** Backend attaches this side-channel summary on PATCH responses when an
+ *  active→inactive transition cascaded-declined future assignments. Lets the
+ *  UI report how many shifts were cleared (and any Outlook failures). */
+export interface DeactivationSummary {
+  declined: number;
+  outlookCleanupFailures: string[];
+}
+export type UpdatePersonResponse = Person & {
+  _deactivation?: DeactivationSummary;
+};
+
 export function usePeople() {
   return useQuery({
     queryKey: KEY,
@@ -27,10 +38,14 @@ export function useUpdatePerson() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ id, input }: { id: string; input: Partial<CreatePersonInput> }) =>
-      api.patch<Person>(`/api/people/${id}`, input),
-    onSuccess: () => {
+      api.patch<UpdatePersonResponse>(`/api/people/${id}`, input),
+    onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: KEY });
       qc.invalidateQueries({ queryKey: ["labels"] });
+      // Deactivation cascade touched assignments — refresh the schedule too.
+      if (res._deactivation) {
+        qc.invalidateQueries({ queryKey: ["schedule", "assignments"] });
+      }
     },
   });
 }

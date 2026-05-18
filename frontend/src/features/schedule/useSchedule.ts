@@ -1,6 +1,59 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  keepPreviousData,
+} from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type { GenerateScheduleResult, ScheduleAssignment } from "@/lib/types";
+
+/**
+ * Fetches the current set of (non-declined) assignments overlapping a date
+ * range. This is the live source of truth for the Schedule grid — it
+ * re-fetches on Generate / Confirm / Decline / Unsync / Assign so any
+ * mutation reflects immediately. The cached generate result still drives
+ * conflicts/warnings in the Assistant.
+ *
+ * Use `invalidateScheduleAssignments(queryClient)` after any mutation that
+ * touches assignments to refresh.
+ */
+export function useScheduleAssignments(
+  from: string | null,
+  to: string | null,
+) {
+  return useQuery({
+    enabled: !!from && !!to,
+    queryKey: ["schedule", "assignments", from, to] as const,
+    queryFn: () =>
+      api.get<ScheduleAssignment[]>(
+        `/api/schedule/assignments?from=${encodeURIComponent(from!)}&to=${encodeURIComponent(to!)}`,
+      ),
+    // Keep prior week's data visible while a new week's fetch is in flight,
+    // so navigating week-to-week doesn't blank the grid.
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** Invalidate every cached per-range assignment query at once. Call this
+ *  inside mutation `onSuccess` to force the visible Schedule grid to refresh. */
+export function invalidateScheduleAssignments(
+  qc: ReturnType<typeof useQueryClient>,
+) {
+  qc.invalidateQueries({ queryKey: ["schedule", "assignments"] });
+}
+
+/**
+ * Fetches every non-declined assignment in the DB (no date range filter).
+ * Used by the Schedule page's "Assignments" panel so admins can see every
+ * proposed/confirmed row regardless of which week the calendar is showing.
+ */
+export function useAllAssignments() {
+  return useQuery({
+    queryKey: ["schedule", "assignments", "all"] as const,
+    queryFn: () =>
+      api.get<ScheduleAssignment[]>("/api/schedule/assignments"),
+  });
+}
 
 interface GenerateInput {
   startDate: string;
@@ -129,12 +182,36 @@ export function useEventCandidates(eventId: string | null) {
   });
 }
 
+/** Error body returned by /events/:id/assign when the event is already at
+ *  capacity. The frontend recognizes this and prompts admin to pick someone
+ *  to replace, then retries with `replacePersonId` set. */
+export interface EventFullyStaffedBody {
+  code: "EVENT_FULLY_STAFFED";
+  message: string;
+  currentAssignments: Array<{
+    assignmentId: string;
+    personId: string;
+    personName: string;
+    status: "proposed" | "confirmed" | "conflict";
+  }>;
+}
+
 export function useAssignToEvent() {
   return useMutation({
-    mutationFn: ({ eventId, personId }: { eventId: string; personId: string }) =>
+    mutationFn: ({
+      eventId,
+      personId,
+      replacePersonId,
+    }: {
+      eventId: string;
+      personId: string;
+      /** When set, atomically removes this person's existing assignment for
+       *  the event before assigning `personId`. */
+      replacePersonId?: string;
+    }) =>
       api.post<{ updatedAssignments: ScheduleAssignment[] }>(
         `/api/schedule/events/${eventId}/assign`,
-        { personId },
+        replacePersonId ? { personId, replacePersonId } : { personId },
       ),
   });
 }
@@ -187,10 +264,19 @@ export interface AcceptConflictInput {
   conflictShortBy: number;
 }
 
+export interface AcceptConflictResult {
+  archiveEntryId: string;
+  /** Backend also drops the event's `requiredStaffCount` to match the
+   *  currently-assigned headcount, so future generates don't re-flag it.
+   *  Returned for toast / UI feedback. */
+  previousRequiredStaffCount: number;
+  newRequiredStaffCount: number;
+}
+
 export function useAcceptConflict() {
   return useMutation({
     mutationFn: (input: AcceptConflictInput) =>
-      api.post<{ archiveEntryId: string }>("/api/schedule/conflicts/accept", input),
+      api.post<AcceptConflictResult>("/api/schedule/conflicts/accept", input),
   });
 }
 
