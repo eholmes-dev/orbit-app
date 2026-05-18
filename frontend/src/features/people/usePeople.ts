@@ -44,7 +44,8 @@ export function useUpdatePerson() {
       qc.invalidateQueries({ queryKey: ["labels"] });
       // Deactivation cascade touched assignments — refresh the schedule too.
       if (res._deactivation) {
-        qc.invalidateQueries({ queryKey: ["schedule", "assignments"] });
+        qc.invalidateQueries({ queryKey: ["schedule", "assignments", "range"] });
+        qc.invalidateQueries({ queryKey: ["schedule", "assignments", "all"] });
       }
     },
   });

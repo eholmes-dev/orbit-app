@@ -59,6 +59,13 @@ model Event {
   overrideRequests   OverrideRequest[]
   createdAt          DateTime          @default(now())
   updatedAt          DateTime          @updatedAt
+
+  // Schedule grid + solver both filter by `startDateTime` overlapping a
+  // date range, almost always excluding cancelled rows. Composite ordering
+  // matters: `cancelledAt` is selective (~null), `startDateTime` is the
+  // range scan.
+  @@index([cancelledAt, startDateTime])
+  @@index([startDateTime])
 }
 
 enum AvailabilityType {
@@ -119,6 +126,11 @@ model Assignment {
   updatedAt         DateTime         @updatedAt
 
   @@unique([eventId, personId])
+  // Schedule grid filters by status (e.g. "non-declined") joined with event
+  // ranges; per-event lookups also dominate (assigned headcount per event).
+  @@index([eventId, status])
+  @@index([personId, status])
+  @@index([status])
 }
 
 enum ArchiveKind {

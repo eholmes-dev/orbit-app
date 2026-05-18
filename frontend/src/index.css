@@ -3,49 +3,61 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Light theme — warm off-white canvas, indigo primary, subtle elevation.
+   Chip backgrounds (shiftColors.ts) are pastel and contrast with the
+   foreground; primary surfaces in this theme should feel soft, not stark. */
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
+  --background: oklch(0.985 0.003 270);
+  --foreground: oklch(0.18 0.015 270);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.18 0.015 270);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --radius: 0.625rem;
+  --popover-foreground: oklch(0.18 0.015 270);
+  --primary: oklch(0.55 0.18 275);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.96 0.01 270);
+  --secondary-foreground: oklch(0.25 0.02 275);
+  --muted: oklch(0.96 0.005 270);
+  --muted-foreground: oklch(0.52 0.015 270);
+  --accent: oklch(0.94 0.03 280);
+  --accent-foreground: oklch(0.32 0.12 280);
+  --destructive: oklch(0.58 0.225 27);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(0.92 0.005 270);
+  --input: oklch(0.92 0.005 270);
+  --ring: oklch(0.55 0.18 275);
+  --radius: 0.75rem;
+  /* Sidebar gets its own tier so it can drop deeper than the canvas in
+     dark mode (matching the reference's darker-rail look). In light mode
+     it just tracks the card surface for a crisp white rail. */
+  --sidebar: var(--card);
 }
 
+/* Dark theme — slate-navy canvas (NOT near-black) with clearly elevated
+   card layer, matching the reference's deep-blue dashboard feel. The
+   foreground stays off-white so it doesn't fight the indigo primary. */
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
-  --destructive: oklch(0.704 0.191 22.216);
-  --destructive-foreground: oklch(0.985 0 0);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --background: oklch(0.22 0.022 260);
+  --foreground: oklch(0.97 0.005 260);
+  --card: oklch(0.27 0.025 260);
+  --card-foreground: oklch(0.97 0.005 260);
+  --popover: oklch(0.29 0.025 260);
+  --popover-foreground: oklch(0.97 0.005 260);
+  --primary: oklch(0.72 0.16 275);
+  --primary-foreground: oklch(0.18 0.02 260);
+  --secondary: oklch(0.32 0.025 260);
+  --secondary-foreground: oklch(0.97 0.005 260);
+  --muted: oklch(0.3 0.022 260);
+  --muted-foreground: oklch(0.72 0.018 260);
+  --accent: oklch(0.36 0.05 275);
+  --accent-foreground: oklch(0.88 0.08 275);
+  --destructive: oklch(0.7 0.2 25);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 13%);
+  --ring: oklch(0.72 0.16 275);
+  /* One tier deeper than the canvas so the rail feels recessed. */
+  --sidebar: oklch(0.18 0.022 260);
 }
 
 @theme inline {
@@ -68,6 +80,7 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -84,6 +97,22 @@
     font-family:
       ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
+  /* Pointer cursor on anything clickable. Browsers default <button> to the
+     arrow cursor, which makes the UI feel inert. Scoping to enabled
+     interactive elements (and giving disabled ones not-allowed) covers
+     shadcn Button, NavLink, [role="button"] chips, label-for-input, and
+     <summary>. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  a[href],
+  label[for],
+  summary {
+    cursor: pointer;
+  }
+  button:disabled,
+  [role="button"][aria-disabled="true"] {
+    cursor: not-allowed;
+  }
 }
 
 @keyframes flash-highlight {
@@ -92,4 +121,23 @@
 }
 .flash-highlight {
   animation: flash-highlight 1.8s ease-out;
+}
+
+/* Availability / "blocked" diagonal stripe overlay used in WeekGrid +
+   DayGrid. Light theme uses a soft warm amber against a light canvas;
+   dark theme needs a brighter, higher-alpha amber so the stripes don't
+   collapse into the navy bg. */
+.block-stripes {
+  background-image: repeating-linear-gradient(
+    45deg,
+    oklch(0.85 0.06 75 / 0.4) 0 6px,
+    transparent 6px 12px
+  );
+}
+.dark .block-stripes {
+  background-image: repeating-linear-gradient(
+    45deg,
+    oklch(0.72 0.14 65 / 0.5) 0 6px,
+    oklch(1 0 0 / 0.04) 6px 12px
+  );
 }

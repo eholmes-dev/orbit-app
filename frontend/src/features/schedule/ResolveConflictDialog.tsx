@@ -94,6 +94,32 @@ function formatTime(iso: string): string {
   });
 }
 
+/** Compact event timespan label for the dialog header — same-day shifts
+ *  collapse to "Mon, Jun 15 · 9am–11am"; multi-day shifts show both endpoints
+ *  with their dates so the admin can see overnight / multi-day shifts at a
+ *  glance ("Mon, Jun 15 9am – Wed, Jun 17 9pm"). */
+function formatEventSpan(startISO: string, endISO: string): string {
+  const s = new Date(startISO);
+  const e = new Date(endISO);
+  const dateFmt: Intl.DateTimeFormatOptions = {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  };
+  const compact = (d: Date) =>
+    new Intl.DateTimeFormat(undefined, {
+      hour: "numeric",
+      minute: d.getMinutes() === 0 ? undefined : "2-digit",
+    })
+      .format(d)
+      .toLowerCase()
+      .replace(" ", "");
+  if (s.toDateString() === e.toDateString()) {
+    return `${s.toLocaleDateString(undefined, dateFmt)} · ${compact(s)}–${compact(e)}`;
+  }
+  return `${s.toLocaleDateString(undefined, dateFmt)} ${compact(s)} – ${e.toLocaleDateString(undefined, dateFmt)} ${compact(e)}`;
+}
+
 function relativeTime(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime();
   const min = Math.round(ms / 60000);
@@ -470,6 +496,15 @@ export function ResolveConflictDialog({
                 )}
               </DialogDescription>
             </>
+          )}
+          {data?.event && (
+            <div className="text-xs text-muted-foreground flex items-center gap-1.5 mt-1">
+              <Clock className="size-3.5 shrink-0" />
+              {formatEventSpan(
+                data.event.startDateTime,
+                data.event.endDateTime,
+              )}
+            </div>
           )}
         </DialogHeader>
 

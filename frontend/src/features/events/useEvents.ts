@@ -32,7 +32,9 @@ export function useEvents({ includeCancelled = false }: UseEventsOptions = {}) {
  *  Schedule grid will keep rendering stale titles/times. */
 function invalidateAllEvents(qc: ReturnType<typeof useQueryClient>) {
   qc.invalidateQueries({ queryKey: ["events"] });
-  qc.invalidateQueries({ queryKey: ["schedule", "assignments"] });
+  // Assignment queries are split into "range" + "all" namespaces — hit both.
+  qc.invalidateQueries({ queryKey: ["schedule", "assignments", "range"] });
+  qc.invalidateQueries({ queryKey: ["schedule", "assignments", "all"] });
   qc.invalidateQueries({ queryKey: ["schedule", "candidates"] });
 }
 

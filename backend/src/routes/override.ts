@@ -171,6 +171,69 @@ overrideRouter.get(
       return;
     }
 
+    // Re-validate state fresh (audit #8) — between the request being sent and
+    // the recipient clicking accept, the admin may have: deactivated the
+    // person, removed required labels, or fully staffed the event another
+    // way. Blindly creating the assignment would silently violate those
+    // constraints. Show a friendly page explaining what changed.
+    const [personFresh, eventFresh, occupiedCount] = await Promise.all([
+      prisma.person.findUniqueOrThrow({
+        where: { id: request.personId },
+        include: { labels: { select: { id: true } } },
+      }),
+      prisma.event.findUniqueOrThrow({
+        where: { id: request.eventId },
+        include: { requiredLabels: { select: { id: true } } },
+      }),
+      // Count non-declined assignments by OTHER people. Don't count self —
+      // accepting may be a re-accept of a previously-declined row.
+      prisma.assignment.count({
+        where: {
+          eventId: request.eventId,
+          status: { not: "declined" },
+          personId: { not: request.personId },
+        },
+      }),
+    ]);
+    if (!personFresh.active) {
+      res.type("html").send(
+        renderResponsePage(
+          "Account inactive",
+          `${escapeHtml(personFresh.name)}'s account has been deactivated in Orbit. Please contact the scheduling admin if this is an error.`,
+          "error",
+        ),
+      );
+      return;
+    }
+    const personLabels = new Set(personFresh.labels.map((l) => l.id));
+    const missingLabels = eventFresh.requiredLabels.filter(
+      (l) => !personLabels.has(l.id),
+    );
+    if (missingLabels.length > 0) {
+      res.type("html").send(
+        renderResponsePage(
+          "Required qualifications changed",
+          `"${escapeHtml(eventFresh.title)}" now requires qualifications you don't have. The scheduling admin will look for an alternative.`,
+          "error",
+        ),
+      );
+      return;
+    }
+    if (occupiedCount >= eventFresh.requiredStaffCount) {
+      // Auto-mark as expired so admin sees it's no longer actionable.
+      await prisma.overrideRequest.update({
+        where: { id: request.id },
+        data: { status: "expired" },
+      });
+      res.type("html").send(
+        renderResponsePage(
+          "Shift already filled",
+          `Someone else already accepted this shift. Thanks for being willing to cover — no action needed on your end.`,
+        ),
+      );
+      return;
+    }
+
     // Apply: trim blocking availability + create/un-decline assignment + mark request accepted.
     await prisma.$transaction(async (tx) => {
       await trimAvailabilityForEvent(

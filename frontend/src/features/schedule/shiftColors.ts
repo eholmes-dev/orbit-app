@@ -1,32 +1,65 @@
 // Stable color assignment for shift cards in the schedule grid. Cards are
 // tinted by the event's first required Label (closest analog to "role" in
-// the reference design). Colors are picked from a pastel palette that sits
-// well on top of the app's neutral background tokens; we map a label's id
-// (hashed) into the palette so colors stay stable across reloads and don't
-// shift when labels are added/removed.
+// the reference design). Each palette entry ships both light and dark
+// variants — the light variant is a soft pastel that reads against a near-
+// white canvas, the dark variant is a more saturated tone with a brighter
+// border + lighter text so the chip feels vibrant against a near-black card.
+// We map a label's id (hashed) into the palette so colors stay stable across
+// reloads and don't shift when labels are added/removed.
 
 interface ShiftColor {
-  /** Tailwind classes for the card background + text. */
+  /** Tailwind classes for the card background + text (both themes). */
   bg: string;
-  /** Tailwind class for the left border (the role-stripe). */
+  /** Tailwind class for the left border (the role-stripe; both themes). */
   border: string;
   /** Raw rgb for inline styles where Tailwind classes can't reach. */
   rgb: string;
 }
 
-// Pastel palette derived from Tailwind's *-100 / *-500 swatches. Each entry
-// is one role color. Order matters only as a deterministic fallback when
-// hashing labels — picking visually-distinct colors next to each other keeps
-// adjacent labels from collapsing into the same hue.
+// Pastel-on-light + saturated-on-dark per role color. Each row picks a hue
+// that stays distinct on both backgrounds; ordered so adjacent labels don't
+// collapse into similar hues.
 const PALETTE: ShiftColor[] = [
-  { bg: "bg-emerald-50 text-emerald-900", border: "border-l-emerald-500", rgb: "rgb(16, 185, 129)" },
-  { bg: "bg-sky-50 text-sky-900", border: "border-l-sky-500", rgb: "rgb(14, 165, 233)" },
-  { bg: "bg-amber-50 text-amber-900", border: "border-l-amber-500", rgb: "rgb(245, 158, 11)" },
-  { bg: "bg-violet-50 text-violet-900", border: "border-l-violet-500", rgb: "rgb(139, 92, 246)" },
-  { bg: "bg-rose-50 text-rose-900", border: "border-l-rose-500", rgb: "rgb(244, 63, 94)" },
-  { bg: "bg-teal-50 text-teal-900", border: "border-l-teal-500", rgb: "rgb(20, 184, 166)" },
-  { bg: "bg-indigo-50 text-indigo-900", border: "border-l-indigo-500", rgb: "rgb(99, 102, 241)" },
-  { bg: "bg-orange-50 text-orange-900", border: "border-l-orange-500", rgb: "rgb(249, 115, 22)" },
+  {
+    bg: "bg-emerald-100 text-emerald-900 dark:bg-emerald-500/25 dark:text-emerald-100",
+    border: "border-l-emerald-500 dark:border-l-emerald-400",
+    rgb: "rgb(16, 185, 129)",
+  },
+  {
+    bg: "bg-sky-100 text-sky-900 dark:bg-sky-500/25 dark:text-sky-100",
+    border: "border-l-sky-500 dark:border-l-sky-400",
+    rgb: "rgb(14, 165, 233)",
+  },
+  {
+    bg: "bg-amber-100 text-amber-900 dark:bg-amber-500/25 dark:text-amber-100",
+    border: "border-l-amber-500 dark:border-l-amber-400",
+    rgb: "rgb(245, 158, 11)",
+  },
+  {
+    bg: "bg-violet-100 text-violet-900 dark:bg-violet-500/25 dark:text-violet-100",
+    border: "border-l-violet-500 dark:border-l-violet-400",
+    rgb: "rgb(139, 92, 246)",
+  },
+  {
+    bg: "bg-rose-100 text-rose-900 dark:bg-rose-500/25 dark:text-rose-100",
+    border: "border-l-rose-500 dark:border-l-rose-400",
+    rgb: "rgb(244, 63, 94)",
+  },
+  {
+    bg: "bg-teal-100 text-teal-900 dark:bg-teal-500/25 dark:text-teal-100",
+    border: "border-l-teal-500 dark:border-l-teal-400",
+    rgb: "rgb(20, 184, 166)",
+  },
+  {
+    bg: "bg-indigo-100 text-indigo-900 dark:bg-indigo-500/25 dark:text-indigo-100",
+    border: "border-l-indigo-500 dark:border-l-indigo-400",
+    rgb: "rgb(99, 102, 241)",
+  },
+  {
+    bg: "bg-orange-100 text-orange-900 dark:bg-orange-500/25 dark:text-orange-100",
+    border: "border-l-orange-500 dark:border-l-orange-400",
+    rgb: "rgb(249, 115, 22)",
+  },
 ];
 
 const NEUTRAL: ShiftColor = {

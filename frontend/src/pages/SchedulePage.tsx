@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   CalendarCheck,
+  CalendarIcon,
   ChevronLeft,
   ChevronRight,
   ChevronDown,
@@ -9,6 +10,12 @@ import {
   CloudOff,
   Table as TableIcon,
 } from "lucide-react";
+import { Calendar } from "@/components/ui/calendar";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -49,6 +56,7 @@ import {
 } from "@/features/schedule/useScheduleView";
 import { useEvents } from "@/features/events/useEvents";
 import { usePeople } from "@/features/people/usePeople";
+import { useScheduleAvailability } from "@/features/availability/useAvailability";
 import type {
   ScheduleAssignment,
   ScheduleConflict,
@@ -81,6 +89,11 @@ function startOfWeekMonday(d: Date): Date {
   date.setDate(date.getDate() + mondayOffset);
   return date;
 }
+
+// Year-dropdown bounds for the toolbar's center date picker. Computed once
+// at module load; matches DateTimeInput's range so the experience is consistent.
+const PICKER_START_MONTH = new Date(new Date().getFullYear() - 5, 0);
+const PICKER_END_MONTH = new Date(new Date().getFullYear() + 10, 11);
 
 type CalendarView = "week" | "day" | "month";
 
@@ -294,6 +307,8 @@ export function SchedulePage() {
   const [currentDate, setCurrentDate] = useState<Date>(() =>
     persistedView.dateISO ? new Date(persistedView.dateISO) : new Date(),
   );
+  // Center date-picker popover (the toolbar label is the trigger).
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
 
   // Mirror the three view-state slots to sessionStorage on every change.
   useEffect(() => {
@@ -320,6 +335,14 @@ export function SchedulePage() {
     [currentView, currentDate],
   );
   const { data: liveAssignments } = useScheduleAssignments(
+    viewRange.start.toISOString(),
+    viewRange.end.toISOString(),
+  );
+
+  // Availability blocks for the visible view range — drives the "blocked"
+  // overlays on person rows in the grid so admins see PTO / out-of-office
+  // at a glance instead of only learning about it from solver conflicts.
+  const { data: availabilityBlocks } = useScheduleAvailability(
     viewRange.start.toISOString(),
     viewRange.end.toISOString(),
   );
@@ -351,22 +374,38 @@ export function SchedulePage() {
   // assignment after Generate would leave a stale "no conflict" cache while
   // the event was actually unfilled. We still pull the `reason` from the
   // cached snapshot when present so the solver's categorization survives.
+  //
+  // Scope: an event is "in scope" if it's in the cached generate range
+  // (existing schedule) OR in the currently visible view range (what admin is
+  // looking at). Without the visible-range arm, removing someone from a
+  // proposed assignment via the Proposed Assignments table — which spans
+  // every week — wouldn't surface as a conflict if the event happened to be
+  // outside the cached range.
   const liveConflicts = useMemo<ScheduleConflict[]>(() => {
     if (!events) return [];
-    // Only score events that were in scope of the last generate. Events
-    // outside that range aren't "the schedule you're working on" yet — they
-    // surface on the next Generate. With no cached range, no conflicts.
-    if (!cached?.range) return [];
-    const rangeStart = new Date(cached.range.startDate).getTime();
-    const rangeEnd = new Date(cached.range.endDate).getTime();
+    const cachedRangeStart = cached?.range
+      ? new Date(cached.range.startDate).getTime()
+      : null;
+    const cachedRangeEnd = cached?.range
+      ? new Date(cached.range.endDate).getTime()
+      : null;
+    const visibleRangeStart = viewRange.start.getTime();
+    const visibleRangeEnd = viewRange.end.getTime();
     const cachedReasonById = new Map(
-      (cached.conflicts ?? []).map((c) => [c.event_id, c.reason]),
+      (cached?.conflicts ?? []).map((c) => [c.event_id, c.reason]),
     );
     return events
       .filter((e) => {
         if (e.cancelledAt) return false;
         const eStart = new Date(e.startDateTime).getTime();
-        if (eStart < rangeStart || eStart >= rangeEnd) return false;
+        const inCachedRange =
+          cachedRangeStart !== null &&
+          cachedRangeEnd !== null &&
+          eStart >= cachedRangeStart &&
+          eStart < cachedRangeEnd;
+        const inVisibleRange =
+          eStart >= visibleRangeStart && eStart < visibleRangeEnd;
+        if (!inCachedRange && !inVisibleRange) return false;
         const assignedCount = assignedCountByEventId.get(e.id) ?? 0;
         return assignedCount < e.requiredStaffCount;
       })
@@ -385,7 +424,7 @@ export function SchedulePage() {
           message: `Short by ${shortBy} — ${assignedCount} of ${e.requiredStaffCount} filled.`,
         };
       });
-  }, [events, assignedCountByEventId, cached]);
+  }, [events, assignedCountByEventId, cached, viewRange]);
 
   // Conflicts panel + the assistant's conflict count read from this. Driven
   // by live state, so post-generate edits stay accurate.
@@ -431,6 +470,14 @@ export function SchedulePage() {
 
   const onGenerate = async () => {
     try {
+      // startDate / endDate are "YYYY-MM-DDTHH:mm" local strings from the
+      // date pickers. `new Date(...)` parses them as the user's local TZ;
+      // `.toISOString()` then converts to UTC for the backend. The reverse
+      // (backend UTC ↔ frontend local display) goes through `new Date(ISO)`
+      // which is also TZ-aware. End result: the literal "Mon 00:00 → Sun
+      // 23:59" the admin picks in their local timezone is what the solver
+      // sees as the range, and what events get displayed against — DO NOT
+      // strip the TZ offset or treat these strings as UTC.
       const startISO = new Date(startDate).toISOString();
       const endISO = new Date(endDate).toISOString();
       const res = await generate.mutateAsync({
@@ -639,9 +686,35 @@ export function SchedulePage() {
               >
                 <ChevronRight className="size-4" />
               </Button>
-              <span className="font-medium text-sm ml-1">
-                {formatViewLabel(currentView, currentDate)}
-              </span>
+              <Popover open={datePickerOpen} onOpenChange={setDatePickerOpen}>
+                <PopoverTrigger asChild>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="font-medium ml-1 gap-1.5"
+                    title="Jump to a specific date"
+                  >
+                    <CalendarIcon className="size-4 opacity-60" />
+                    {formatViewLabel(currentView, currentDate)}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="single"
+                    selected={currentDate}
+                    defaultMonth={currentDate}
+                    onSelect={(d) => {
+                      if (d) setCurrentDate(d);
+                      setDatePickerOpen(false);
+                    }}
+                    captionLayout="dropdown"
+                    startMonth={PICKER_START_MONTH}
+                    endMonth={PICKER_END_MONTH}
+                    autoFocus
+                  />
+                </PopoverContent>
+              </Popover>
             </div>
             <div className="inline-flex rounded-md border bg-card">
               {(["week", "day", "month"] as const).map((v, i, arr) => (
@@ -673,6 +746,8 @@ export function SchedulePage() {
               people={activePeople}
               assignments={assignments}
               events={unassignedEvents}
+              availability={availabilityBlocks ?? []}
+              assignedCountByEventId={assignedCountByEventId}
               onSelectAssignment={(a) => setDecliningAssignment(a)}
               onSelectEvent={onSelectEvent}
             />
@@ -683,6 +758,8 @@ export function SchedulePage() {
               people={activePeople}
               assignments={assignments}
               events={unassignedEvents}
+              availability={availabilityBlocks ?? []}
+              assignedCountByEventId={assignedCountByEventId}
               onSelectAssignment={(a) => setDecliningAssignment(a)}
               onSelectEvent={onSelectEvent}
             />
@@ -803,15 +880,24 @@ export function SchedulePage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              Push {proposedCount} event{proposedCount === 1 ? "" : "s"} to Outlook?
+              Push {proposedCount} assignment{proposedCount === 1 ? "" : "s"} to Outlook?
             </AlertDialogTitle>
-            <AlertDialogDescription>
-              This creates a calendar event on each assigned staff member's
-              Outlook calendar. Staff will see the event immediately.
-              <br />
-              <br />
-              Already-confirmed assignments are skipped. Per-assignment failures
-              don't block the rest of the batch.
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>
+                  This creates a calendar event on each assigned staff member's
+                  Outlook calendar. Staff will see the event immediately.
+                </p>
+                <p className="text-amber-700 font-medium">
+                  Scope: <strong>all proposed assignments across all dates</strong>
+                  {" "}— not just the week you're currently viewing. Includes any
+                  future shifts pending from earlier Generate runs.
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Already-confirmed assignments are skipped. Per-assignment
+                  failures don't block the rest of the batch.
+                </p>
+              </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -819,7 +905,7 @@ export function SchedulePage() {
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction onClick={onConfirm} disabled={confirmMut.isPending}>
-              {confirmMut.isPending ? "Syncing…" : "Confirm & sync"}
+              {confirmMut.isPending ? "Syncing…" : `Publish all ${proposedCount}`}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

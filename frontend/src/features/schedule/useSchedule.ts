@@ -23,7 +23,7 @@ export function useScheduleAssignments(
 ) {
   return useQuery({
     enabled: !!from && !!to,
-    queryKey: ["schedule", "assignments", from, to] as const,
+    queryKey: ["schedule", "assignments", "range", from, to] as const,
     queryFn: () =>
       api.get<ScheduleAssignment[]>(
         `/api/schedule/assignments?from=${encodeURIComponent(from!)}&to=${encodeURIComponent(to!)}`,
@@ -34,12 +34,14 @@ export function useScheduleAssignments(
   });
 }
 
-/** Invalidate every cached per-range assignment query at once. Call this
- *  inside mutation `onSuccess` to force the visible Schedule grid to refresh. */
+/** Invalidate every cached per-range assignment query plus the all-DB list.
+ *  We split the namespaces (`range` vs `all`) so future mutations can target
+ *  one or the other instead of nuking everything. */
 export function invalidateScheduleAssignments(
   qc: ReturnType<typeof useQueryClient>,
 ) {
-  qc.invalidateQueries({ queryKey: ["schedule", "assignments"] });
+  qc.invalidateQueries({ queryKey: ["schedule", "assignments", "range"] });
+  qc.invalidateQueries({ queryKey: ["schedule", "assignments", "all"] });
 }
 
 /**
@@ -169,15 +171,17 @@ export function useEventCandidates(eventId: string | null) {
       api.get<CandidatesResponse>(
         `/api/schedule/events/${eventId}/candidates`,
       ),
-    // Auto-poll every 5s while there's at least one pending override request,
+    // Auto-poll every 15s while there's at least one pending override request,
     // so the dialog reflects the recipient's accept/decline without an admin
-    // refresh. Once nothing is pending, polling stops on the next tick.
+    // refresh. 15s is the sweet spot — fast enough that the admin won't notice
+    // staleness, slow enough that we're not pummeling the backend for the
+    // duration the dialog is open.
     refetchInterval: (query) => {
       const data = query.state.data as CandidatesResponse | undefined;
       const hasPending = data?.candidates.some(
         (c) => c.pendingOverrideRequest !== null,
       );
-      return hasPending ? 5000 : false;
+      return hasPending ? 15000 : false;
     },
   });
 }
