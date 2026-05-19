@@ -2,7 +2,7 @@
 
 Healthcare scheduling app with constraint-based scheduling and Microsoft Outlook sync.
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Feholmes-dev%2Forbit-app%2Fmain%2Finfra%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fraw.githubusercontent.com%2Feholmes-dev%2Forbit-app%2Fmain%2Finfra%2FcreateUiDefinition.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Feholmes-dev%2Forbit-app%40main%2Finfra%2Fmain.json/createUIDefinitionUri/https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Feholmes-dev%2Forbit-app%40main%2Finfra%2FcreateUiDefinition.json)
 
 ## Install options
 
