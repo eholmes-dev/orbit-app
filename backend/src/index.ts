@@ -1,3 +1,5 @@
+import path from "node:path";
+import fs from "node:fs";
 import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
@@ -40,6 +42,29 @@ app.use("/api/labels", requireAuth, labelsRouter);
 app.use("/api/events", requireAuth, eventsRouter);
 app.use("/api/availability", requireAuth, availabilityRouter);
 app.use("/api/schedule", requireAuth, scheduleRouter);
+
+// Bundled-Docker mode: serve the built frontend from this same Express
+// process so the whole app runs on one origin (no CORS, no separate
+// nginx). The STATIC_DIR env var is set by the Docker image's runtime
+// stage; in `npm run dev` it's unset and this whole branch is skipped,
+// leaving Vite to serve the frontend on :5173.
+if (process.env.STATIC_DIR) {
+  const staticDir = path.resolve(process.env.STATIC_DIR);
+  if (fs.existsSync(staticDir)) {
+    app.use(express.static(staticDir));
+    // Client-side routing: any non-/api GET falls back to index.html so
+    // deep links like /schedule reload cleanly.
+    app.get("*", (req, res, next) => {
+      if (req.path.startsWith("/api")) return next();
+      res.sendFile(path.join(staticDir, "index.html"));
+    });
+    console.log(`[backend] serving frontend from ${staticDir}`);
+  } else {
+    console.warn(
+      `[backend] STATIC_DIR=${staticDir} set but directory missing — frontend will not be served`,
+    );
+  }
+}
 
 app.use(notFoundHandler);
 app.use(errorHandler);

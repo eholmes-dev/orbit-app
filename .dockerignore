@@ -1,0 +1,40 @@
+# Never copy node_modules into the build context — the Dockerfile runs
+# `npm ci` itself for a clean, reproducible install.
+**/node_modules
+
+# Build artifacts
+**/dist
+**/build
+**/.next
+
+# Test + dev tooling
+**/coverage
+**/playwright-report
+**/test-results
+**/.vite
+**/.cache
+
+# Secrets and local env
+.env
+.env.local
+.env.*.local
+**/.env
+!.env.example
+
+# Editor / OS clutter
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Docs / repo meta
+*.md
+docs/
+
+# Don't pull the Python scheduler source into the backend image — it has
+# its own Dockerfile and build context.
+scheduler/

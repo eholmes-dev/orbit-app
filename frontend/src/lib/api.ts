@@ -1,4 +1,13 @@
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
+// API base URL. Two modes:
+// - Dev (Vite + Express on different ports): VITE_API_URL unset → defaults
+//   to http://localhost:4000 so cross-origin fetch works.
+// - Bundled Docker (Express serves both /api and the static frontend on the
+//   same origin): build sets VITE_API_URL="" so requests are same-origin
+//   relative paths (/api/...).
+const API_URL =
+  import.meta.env.VITE_API_URL !== undefined
+    ? import.meta.env.VITE_API_URL
+    : "http://localhost:4000";
 
 export class ApiError extends Error {
   status: number;

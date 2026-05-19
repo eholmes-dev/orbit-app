@@ -1,0 +1,87 @@
+# Full Orbit stack — postgres + scheduler + backend (which serves the
+# bundled frontend). Designed to run from a single `docker compose up`
+# after copying .env.example → .env and filling in Azure creds.
+#
+# Useful commands (also exposed via root npm scripts):
+#   docker compose up -d            # start everything
+#   docker compose up -d postgres   # database only (dev/Phase-1 workflow)
+#   docker compose down             # stop + remove containers (volume persists)
+#   docker compose logs -f          # follow combined logs
+#   docker compose build            # rebuild images after source changes
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: orbit-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orbit
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-orbit-dev-password}
+      POSTGRES_DB: orbit
+    ports:
+      # Exposed so the host can reach it for Prisma Studio / psql.
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orbit -d orbit"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  scheduler:
+    build:
+      context: ./scheduler
+    image: orbit-scheduler:local
+    container_name: orbit-scheduler
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: orbit-backend:local
+    container_name: orbit-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      scheduler:
+        condition: service_started
+    ports:
+      - "4000:4000"
+    # Inherit Azure / session secrets / public URLs from the host .env.
+    env_file:
+      - .env
+    # Override the entries that the container resolves differently from
+    # the host (postgres + scheduler via the compose internal network).
+    # DIRECT_URL is force-cleared so the prisma-shim fallback uses the
+    # bundled DATABASE_URL for migrations — otherwise the host .env's
+    # Supabase DIRECT_URL leaks through env_file and `prisma migrate
+    # deploy` ends up targeting the wrong database.
+    environment:
+      DATABASE_URL: postgresql://orbit:${POSTGRES_PASSWORD:-orbit-dev-password}@postgres:5432/orbit
+      DIRECT_URL: ""
+      SCHEDULER_URL: http://scheduler:8000
+      # In bundled mode the backend serves the frontend on the same port —
+      # post-login redirects go back to the backend, not the dev Vite server.
+      APP_BASE_URL: http://localhost:4000
+      # Node 20's undici tries DNS-returned addresses in resolution order. On
+      # IPv4-only Docker networks, AAAA-first responses (which Docker's
+      # embedded resolver tends to return for Microsoft endpoints) hang the
+      # OAuth token exchange with ENETUNREACH. Force IPv4-first lookups.
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
+    # Bypass Docker's embedded DNS (127.0.0.11) for upstream lookups — it has
+    # been observed to drop A records for certain hostnames (e.g.
+    # login.microsoftonline.com), leaving the container with IPv6-only
+    # addresses it can't reach. 1.1.1.1 / 8.8.8.8 return both A and AAAA so
+    # the ipv4first flag above has actual IPv4 addresses to pick from.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+volumes:
+  postgres-data:
+    name: orbit-postgres-data

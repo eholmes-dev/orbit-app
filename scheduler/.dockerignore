@@ -1,0 +1,17 @@
+# uv handles its own venv inside the build; never copy the local one.
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editor / OS clutter
+.git
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Tests / docs
+tests/
+*.md

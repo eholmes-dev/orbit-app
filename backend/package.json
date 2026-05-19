@@ -7,9 +7,10 @@
     "dev": "dotenv -e ../.env -- tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "dotenv -e ../.env -- node dist/index.js",
-    "prisma:generate": "dotenv -e ../.env -- prisma generate",
-    "prisma:migrate": "dotenv -e ../.env -- prisma migrate dev",
-    "prisma:studio": "dotenv -e ../.env -- prisma studio"
+    "prisma:generate": "dotenv -e ../.env -- node scripts/prisma-shim.cjs generate",
+    "prisma:migrate": "dotenv -e ../.env -- node scripts/prisma-shim.cjs migrate dev",
+    "prisma:migrate:deploy": "dotenv -e ../.env -- node scripts/prisma-shim.cjs migrate deploy",
+    "prisma:studio": "dotenv -e ../.env -- node scripts/prisma-shim.cjs studio"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

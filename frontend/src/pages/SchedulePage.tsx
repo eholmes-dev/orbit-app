@@ -6,7 +6,6 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronDown,
-  Loader2,
   CloudOff,
   Table as TableIcon,
 } from "lucide-react";
