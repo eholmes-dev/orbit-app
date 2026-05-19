@@ -68,6 +68,39 @@ The three values from steps 4–5 are what the Deploy to Azure wizard asks for.
 
 ---
 
+## Pausing or tearing down an Azure deployment
+
+The deploy provisions a Postgres Flexible Server that bills continuously (~$13/mo) regardless of traffic. Three options for when you don't need the deployment running:
+
+### Pause — keep data + config (~$3/month)
+
+Best when you'll come back to *this* deployment with its data.
+
+1. Azure portal → your resource group → **Postgres server** (`orbit-pg-xxxxxx`) → **Stop** in the top toolbar.
+2. *(Optional)* `orbit-backend` Container App → **Scale** in the left sidebar → **Min replicas: 0** → Save.
+
+Cost while paused: ~$3/month (Postgres storage only).
+
+**To resume:** **Start** the Postgres server (~2 min), and bump backend min replicas back to 1 if you changed it. Data, Entra wiring, Key Vault secrets — all preserved.
+
+> ⚠️ **Azure auto-restarts stopped Postgres servers after 7 days.** If you leave it paused longer than a week, re-stop it (or it'll quietly start billing the compute hours again).
+
+### Full teardown — $0 (fastest if you're done)
+
+Best when you're done with this deployment and OK losing data. Bicep is in git, so redeploying is one click of the Deploy to Azure button.
+
+1. Azure portal → **Resource groups** → click your RG → **Delete resource group** → type the name to confirm.
+
+Takes ~3 minutes. Every resource (Postgres, Container Apps, Key Vault, Log Analytics, secrets) is gone.
+
+> ⚠️ **Key Vault soft-delete (7 days).** The Bicep sets `softDeleteRetentionInDays: 7`, so the vault sits in a soft-delete state for a week after RG deletion. If you redeploy with the same `namePrefix` within 7 days, you'll hit "vault already exists." Fix: use a different prefix, or purge the deleted vault (portal → **Key vaults** → **Manage deleted vaults** → select → **Purge**).
+
+### Cost-alert safety net (recommended before any test deploy)
+
+Azure portal → **Cost Management** → **Budgets** → **Add** → scope to your resource group, set ~$10/month with an email alert at 50%. Takes a minute, costs nothing.
+
+---
+
 ## Development workflow
 
 For day-to-day development against Supabase (the project's current dev setup):
