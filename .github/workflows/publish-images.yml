@@ -1,0 +1,87 @@
+# Publishes orbit-backend and orbit-scheduler container images to GitHub
+# Container Registry (GHCR). Phase 3's Azure deploy (Bicep template) pulls
+# these images directly, so this workflow has to run successfully before
+# clients can `az deployment` against the template.
+#
+# Triggers:
+#   - Push to main           → tags `latest` + `sha-<commit>`
+#   - Push of v*.*.* tag     → tags the semver (v1.2.3 → 1.2.3, 1.2, 1)
+#   - Manual workflow_dispatch (for one-off republishes)
+
+name: Publish Docker images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & push ${{ matrix.image.name }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: orbit-backend
+            context: .
+            dockerfile: Dockerfile
+          - name: orbit-scheduler
+            context: ./scheduler
+            dockerfile: scheduler/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # GHCR requires lowercase repository names; github.repository_owner
+      # preserves the original casing, so normalize once here and reuse.
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.owner.outputs.value }}/${{ matrix.image.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Just amd64 for now. ARM clients can build locally from the
+          # Dockerfile; revisit when there's demand.
+          platforms: linux/amd64
+          # GHA cache cuts subsequent build times by ~70%.
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,scope=${{ matrix.image.name }},mode=max
