@@ -52,6 +52,9 @@ param backendImage string = 'ghcr.io/eholmes-dev/orbit-backend:latest'
 @description('Container image for orbit-scheduler. Override only if you fork and host your own.')
 param schedulerImage string = 'ghcr.io/eholmes-dev/orbit-scheduler:latest'
 
+@description('Comma-separated CIDR ranges allowed to reach the app (e.g. "203.0.113.0/24, 198.51.100.42/32"). Leave blank for public access — sign-in is still required either way.')
+param allowedIpRanges string = ''
+
 // Bicep only allows `newGuid()` in parameter defaults — that's why these
 // two secrets are parameters with auto-generated defaults rather than vars.
 // The client doesn't see or paste them; Bicep generates them at deploy time
@@ -79,6 +82,22 @@ var managedIdentityName = '${namePrefix}-identity'
 var containerAppEnvName = '${namePrefix}-cae'
 var backendAppName = '${namePrefix}-backend'
 var schedulerAppName = '${namePrefix}-scheduler'
+
+// Parse the comma-separated `allowedIpRanges` parameter into the shape
+// Container Apps' ingress.ipSecurityRestrictions expects. An empty list
+// means "no restrictions" (the platform allows all traffic in that case),
+// matching the parameter's default behavior.
+var allowedRangeList = empty(allowedIpRanges)
+  ? []
+  : split(replace(allowedIpRanges, ' ', ''), ',')
+
+var ipRestrictions = [
+  for (range, i) in allowedRangeList: {
+    name: 'AllowedRange${i}'
+    ipAddressRange: range
+    action: 'Allow'
+  }
+]
 
 // -----------------------------------------------------------------------------
 // Log Analytics — Container Apps Environment needs one
@@ -293,6 +312,10 @@ resource backendApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 4000
         transport: 'auto'
         allowInsecure: false
+        // When `allowedIpRanges` is non-empty, only the listed CIDRs can
+        // reach the app; everything else gets a 403 at ingress. An empty
+        // array means "allow all" — the public-but-auth-gated default.
+        ipSecurityRestrictions: ipRestrictions
       }
       secrets: [
         {

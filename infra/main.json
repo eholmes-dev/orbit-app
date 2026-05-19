@@ -5,7 +5,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.43.8.12551",
-      "templateHash": "9720201919440902512"
+      "templateHash": "17139152998996522695"
     }
   },
   "parameters": {
@@ -63,6 +63,13 @@
         "description": "Container image for orbit-scheduler. Override only if you fork and host your own."
       }
     },
+    "allowedIpRanges": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Comma-separated CIDR ranges allowed to reach the app (e.g. \"203.0.113.0/24, 198.51.100.42/32\"). Leave blank for public access — sign-in is still required either way."
+      }
+    },
     "sessionSecret": {
       "type": "securestring",
       "defaultValue": "[format('{0}{1}', newGuid(), newGuid())]",
@@ -79,6 +86,17 @@
     }
   },
   "variables": {
+    "copy": [
+      {
+        "name": "ipRestrictions",
+        "count": "[length(variables('allowedRangeList'))]",
+        "input": {
+          "name": "[format('AllowedRange{0}', copyIndex('ipRestrictions'))]",
+          "ipAddressRange": "[variables('allowedRangeList')[copyIndex('ipRestrictions')]]",
+          "action": "Allow"
+        }
+      }
+    ],
     "suffix": "[take(uniqueString(resourceGroup().id), 6)]",
     "logWorkspaceName": "[format('{0}-logs-{1}', parameters('namePrefix'), variables('suffix'))]",
     "keyVaultName": "[format('{0}-kv-{1}', parameters('namePrefix'), variables('suffix'))]",
@@ -87,6 +105,7 @@
     "containerAppEnvName": "[format('{0}-cae', parameters('namePrefix'))]",
     "backendAppName": "[format('{0}-backend', parameters('namePrefix'))]",
     "schedulerAppName": "[format('{0}-scheduler', parameters('namePrefix'))]",
+    "allowedRangeList": "[if(empty(parameters('allowedIpRanges')), createArray(), split(replace(parameters('allowedIpRanges'), ' ', ''), ','))]",
     "keyVaultSecretsUserRoleId": "4633458b-17de-408a-b874-0445c86b69e6"
   },
   "resources": [
@@ -309,7 +328,8 @@
             "external": true,
             "targetPort": 4000,
             "transport": "auto",
-            "allowInsecure": false
+            "allowInsecure": false,
+            "ipSecurityRestrictions": "[variables('ipRestrictions')]"
           },
           "secrets": [
             {

@@ -26,6 +26,8 @@ Click the **Deploy to Azure** button above. You'll need:
 
 The portal opens a 2-step wizard asking for an admin email and your Entra app registration's tenant ID + client ID + client secret. ~10 minutes from "click" to "open in browser."
 
+**Optional network restriction:** The wizard also accepts a comma-separated list of CIDR ranges that are allowed to reach the app (e.g. `203.0.113.0/24, 198.51.100.42/32`). Anyone outside those ranges gets a 403 at the ingress — before they ever see the sign-in page. Leave the field blank to keep the app public (sign-in is still required either way). This is the simplest way to scope the deployment to your office / VPN network without buying into a full intranet VNet story.
+
 After deploy, copy the `redirectUri` output into your Entra app registration's **Authentication → Web → Redirect URIs**, then open `appUrl` in a browser.
 
 ### Option 2: Self-hosted Docker
