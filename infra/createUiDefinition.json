@@ -1,0 +1,121 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/0.1.2-preview/CreateUIDefinition.MultiVm.json#",
+  "handler": "Microsoft.Azure.CreateUIDef",
+  "version": "0.1.2-preview",
+  "parameters": {
+    "config": {
+      "isWizard": true,
+      "basics": {
+        "description": "Orbit deploys to your Azure subscription as two Container Apps + Postgres + Key Vault, all in the same resource group. Total runtime cost: ~$15-25/month.",
+        "subscription": {
+          "constraints": {
+            "validations": []
+          }
+        },
+        "resourceGroup": {
+          "allowExisting": true
+        },
+        "location": {
+          "label": "Region",
+          "toolTip": "Pick the region closest to your users. Microsoft Container Apps + Postgres Flexible Server must be available there.",
+          "visible": true
+        }
+      }
+    },
+    "basics": [
+      {
+        "name": "namePrefix",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Resource name prefix",
+        "defaultValue": "orbit",
+        "toolTip": "Lowercase letters and numbers only. Used as the prefix for every resource (e.g. 'orbit-backend', 'orbit-pg-xxxxxx').",
+        "constraints": {
+          "required": true,
+          "regex": "^[a-z][a-z0-9]{2,10}$",
+          "validationMessage": "3–11 characters; lowercase letters and numbers only; must start with a letter."
+        }
+      },
+      {
+        "name": "adminEmail",
+        "type": "Microsoft.Common.TextBox",
+        "label": "Admin email",
+        "toolTip": "Email of the first admin user. Must match a user in your Microsoft Entra tenant so they can sign in.",
+        "constraints": {
+          "required": true,
+          "regex": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+          "validationMessage": "Enter a valid email address."
+        }
+      }
+    ],
+    "steps": [
+      {
+        "name": "msEntra",
+        "label": "Microsoft Entra connection",
+        "subLabel": {
+          "preValidation": "Set up your Entra app registration",
+          "postValidation": "Connected"
+        },
+        "bladeTitle": "Microsoft Entra connection",
+        "elements": [
+          {
+            "name": "entraInfo",
+            "type": "Microsoft.Common.InfoBox",
+            "visible": true,
+            "options": {
+              "icon": "Info",
+              "text": "Orbit signs users in with Microsoft. Before continuing you need an Entra app registration. See the README for the 5-minute setup walkthrough. You'll paste three values below: Tenant ID, Application (client) ID, and a Client secret value.",
+              "uri": "https://github.com/eholmes-dev/orbit-app#entra-app-registration"
+            }
+          },
+          {
+            "name": "msTenantId",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Microsoft Entra tenant ID",
+            "toolTip": "From Entra portal → Overview → Tenant ID (a GUID).",
+            "constraints": {
+              "required": true,
+              "regex": "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$",
+              "validationMessage": "Expected a GUID like 00000000-0000-0000-0000-000000000000."
+            }
+          },
+          {
+            "name": "msClientId",
+            "type": "Microsoft.Common.TextBox",
+            "label": "Application (client) ID",
+            "toolTip": "From your Entra app registration → Overview → Application (client) ID.",
+            "constraints": {
+              "required": true,
+              "regex": "^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$",
+              "validationMessage": "Expected a GUID like 00000000-0000-0000-0000-000000000000."
+            }
+          },
+          {
+            "name": "msClientSecret",
+            "type": "Microsoft.Common.PasswordBox",
+            "label": {
+              "password": "Client secret value",
+              "confirmPassword": "Confirm client secret"
+            },
+            "toolTip": "The VALUE column from Entra app registration → Certificates & secrets. Not the Secret ID. Stored in Azure Key Vault on deploy.",
+            "constraints": {
+              "required": true,
+              "regex": "^.{8,}$",
+              "validationMessage": "Paste the secret value (at least 8 characters)."
+            },
+            "options": {
+              "hideConfirmation": true
+            }
+          }
+        ]
+      }
+    ],
+    "outputs": {
+      "namePrefix": "[basics('namePrefix')]",
+      "adminEmail": "[basics('adminEmail')]",
+      "msTenantId": "[steps('msEntra').msTenantId]",
+      "msClientId": "[steps('msEntra').msClientId]",
+      "msClientSecret": "[steps('msEntra').msClientSecret]",
+      "location": "[location()]"
+    }
+  }
+}
